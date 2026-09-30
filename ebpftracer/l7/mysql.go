@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
+
+	"github.com/coroot/coroot-node-agent/common"
 )
 
 const (
@@ -29,15 +31,23 @@ func (p *MysqlParser) Parse(payload []byte, statementId uint32) string {
 		return ""
 	}
 	msgSize := int(payload[0]) | int(payload[1])<<8 | int(payload[2])<<16
+	if msgSize < 1 { // a command packet contains at least the command byte
+		common.AgentL7ParseErrors.WithLabelValues("mysql").Inc()
+		return ""
+	}
 	cmd := payload[4]
 	readQuery := func() (query string) {
+		from := mysqlMsgHeaderSize + 1
 		to := mysqlMsgHeaderSize + msgSize
 		partial := false
 		if to > payloadSize {
 			to = payloadSize
 			partial = true
 		}
-		query = string(payload[mysqlMsgHeaderSize+1 : to])
+		if to < from {
+			return ""
+		}
+		query = string(payload[from:to])
 		if partial {
 			query += "..."
 		}
