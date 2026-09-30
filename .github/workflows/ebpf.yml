@@ -1,0 +1,44 @@
+name: eBPF programs
+
+# ebpftracer/ebpf.go embeds the compiled eBPF programs and is shipped as is by the release build.
+# This workflow rebuilds it with the pinned toolchain (ebpftracer/Dockerfile) whenever the eBPF sources change,
+# so the embedded bytecode always matches the sources and the toolchain the programs were validated with.
+# For pull requests from this repository the regenerated file is committed to the PR branch,
+# for pull requests from forks the job fails and the file must be regenerated with `make -C ebpftracer build`.
+
+on:
+  pull_request:
+    paths:
+      - 'ebpftracer/ebpf/**'
+      - 'ebpftracer/Dockerfile'
+      - 'ebpftracer/ebpf.go'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      - run: make -C ebpftracer build
+
+      - name: Commit the regenerated ebpf.go
+        run: |
+          if git diff --quiet -- ebpftracer/ebpf.go; then
+            echo "ebpftracer/ebpf.go is up to date"
+            exit 0
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]]; then
+            echo "::error::ebpftracer/ebpf.go is out of date, run 'make -C ebpftracer build' and commit the result"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ebpftracer/ebpf.go
+          git commit -m "ebpftracer: regenerate ebpf.go"
+          git push

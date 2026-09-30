@@ -874,7 +874,11 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	var trace *tracing.Trace
 	if !ebpfTracesDisabled {
-		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+		var end time.Time // the time the response was observed by the kernel, zero means now
+		if r.Timestamp != 0 {
+			end = tracing.MonotonicToTime(r.Timestamp)
+		}
+		trace = c.tracer.NewTraceAt(conn.DestinationKey.ActualDestinationIfKnown(), end)
 	}
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
