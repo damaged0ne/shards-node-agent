@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coroot/coroot-node-agent/common"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
@@ -136,10 +137,12 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 		if next > len(payload) {
 			next = len(payload)
 		}
-		if _, err := decoder.Write(payload[offset:next]); err != nil {
+		_, err := decoder.Write(payload[offset:next])
+		offset = next // skip the header block even if it cannot be decoded
+		if err != nil {
+			common.AgentL7ParseErrors.WithLabelValues("http2").Inc()
 			continue
 		}
-		offset = next
 	}
 	var res []Http2Request
 	for streamId, status := range statuses {
@@ -154,16 +157,20 @@ func (p *Http2Parser) Parse(method Method, payload []byte, kernelTime uint64) []
 		} else {
 			r.GrpcStatus = -1
 		}
-		r.Duration = time.Duration(kernelTime - r.kernelTime)
+		if kernelTime >= r.kernelTime {
+			r.Duration = time.Duration(kernelTime - r.kernelTime)
+		} else { // events arrived out of order
+			r.Duration = 0
+		}
 		res = append(res, *r)
 		delete(p.activeRequests, streamId)
 	}
 
 	// GC
-	if kernelTime-p.lastGcTime > http2DecoderGcInterval {
+	if kernelTime > p.lastGcTime && kernelTime-p.lastGcTime > http2DecoderGcInterval {
 		if p.lastGcTime > 0 {
 			for streamId, r := range p.activeRequests {
-				if kernelTime-r.kernelTime > http2DecoderGcInterval {
+				if kernelTime > r.kernelTime && kernelTime-r.kernelTime > http2DecoderGcInterval {
 					delete(p.activeRequests, streamId)
 				}
 			}

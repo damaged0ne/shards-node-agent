@@ -63,4 +63,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.ShardsLoad1
 	ch <- metrics.ShardsLoad5
 	ch <- metrics.ShardsLoad15
+	ch <- NodePsiCPU
+	ch <- NodePsiMemory
+	ch <- NodePsiIO
 }

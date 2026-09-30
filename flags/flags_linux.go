@@ -14,6 +14,7 @@ const (
 
 var (
 	CgroupRoot              = kingpin.Flag("cgroupfs-root", "The mount point of the host cgroupfs root").Default("/sys/fs/cgroup").Envar("CGROUPFS_ROOT").String()
+	DisableDelayAccounting  = kingpin.Flag("disable-delay-accounting", "Don't collect CPU and disk delays via taskstats (netlink). Use it on kernels where taskstats queries are unsafe, e.g. some Amazon Linux 2023 6.12 builds panic in bacct_add_tsk").Default("false").Envar("DISABLE_DELAY_ACCOUNTING").Bool()
 	DisablePinger           = kingpin.Flag("disable-pinger", "Don't ping upstreams").Default("false").Envar("DISABLE_PINGER").Bool()
 	DisableL7Tracing        = kingpin.Flag("disable-l7-tracing", "Disable L7 tracing").Default("false").Envar("DISABLE_L7_TRACING").Bool()
 	EnableJavaTls           = kingpin.Flag("enable-java-tls", "Enable Java TLS instrumentation via dynamic agent loading").Default("false").Envar("ENABLE_JAVA_TLS").Bool()

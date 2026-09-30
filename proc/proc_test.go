@@ -3,6 +3,7 @@ package proc
 import (
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,4 +81,10 @@ func TestGetSockets(t *testing.T) {
 		{Inode: "11139979", SAddr: ipp("[fe80::48cb:8b57:3c30:e6ac]:8080"), DAddr: ipp("[::]:0"), Listen: true},
 		{Inode: "11154515", SAddr: ipp("127.0.0.1:8081"), DAddr: ipp("[::]:0"), Listen: true},
 	}, res)
+}
+
+func TestGetStartTime(t *testing.T) {
+	st, err := GetStartTime(123)
+	require.NoError(t, err)
+	assert.Equal(t, time.Unix(1700000000, 0).Add(123450*time.Millisecond), st)
 }

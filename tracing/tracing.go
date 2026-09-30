@@ -18,6 +18,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.18.0"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 )
 
@@ -26,6 +27,7 @@ const (
 )
 
 var (
+	spanProcessor       sdktrace.SpanProcessor
 	batcher             sdktrace.TracerProviderOption
 	commonResourceAttrs []attribute.KeyValue
 	agentVersion        string
@@ -68,10 +70,33 @@ func Init(machineId, hostname, version string) {
 		klog.Exitln(err)
 	}
 
-	batcher = sdktrace.WithBatcher(exporter)
+	// A single batch span processor is shared by all per-container tracer providers.
+	spanProcessor = sdktrace.NewBatchSpanProcessor(exporter)
+	batcher = sdktrace.WithSpanProcessor(spanProcessor)
 	commonResourceAttrs = []attribute.KeyValue{semconv.HostName(hostname), semconv.HostID(machineId)}
 	agentVersion = version
 	initialized = true
+}
+
+// Shutdown flushes buffered spans and shuts down the exporter. It should be called on agent exit.
+func Shutdown(ctx context.Context) {
+	if spanProcessor == nil {
+		return
+	}
+	if err := spanProcessor.Shutdown(ctx); err != nil {
+		klog.Warningln("failed to shutdown the traces exporter:", err)
+	}
+}
+
+// MonotonicToTime converts a CLOCK_MONOTONIC timestamp in nanoseconds (as returned by bpf_ktime_get_ns())
+// to wall clock time.
+func MonotonicToTime(ns uint64) time.Time {
+	now := time.Now()
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		return now
+	}
+	return now.Add(-time.Duration(ts.Nano() - int64(ns)))
 }
 
 type Tracer struct {
@@ -108,7 +133,13 @@ func GetContainerTracer(containerId string) *Tracer {
 }
 
 func (t *Tracer) NewTrace(destination common.HostPort) *Trace {
-	return &Trace{tracer: t, destination: destination, commonAttrs: []attribute.KeyValue{
+	return t.NewTraceAt(destination, time.Time{})
+}
+
+// NewTraceAt is like NewTrace, but spans end at the given time (e.g. the kernel event time converted
+// with MonotonicToTime) rather than at the time they are created. A zero end means time.Now().
+func (t *Tracer) NewTraceAt(destination common.HostPort, end time.Time) *Trace {
+	return &Trace{tracer: t, destination: destination, end: end, commonAttrs: []attribute.KeyValue{
 		semconv.NetPeerName(destination.Host()),
 		semconv.NetPeerPort(int(destination.Port())),
 	}}
@@ -117,6 +148,7 @@ func (t *Tracer) NewTrace(destination common.HostPort) *Trace {
 type Trace struct {
 	tracer      *Tracer
 	destination common.HostPort
+	end         time.Time
 	commonAttrs []attribute.KeyValue
 }
 
@@ -124,14 +156,16 @@ func (t *Trace) createSpan(name string, duration time.Duration, error bool, attr
 	if t.tracer.otel == nil {
 		return
 	}
-	end := time.Now()
-
 	if !shouldSample() {
 		return
 	}
 
+	end := t.end
+	if end.IsZero() {
+		end = time.Now()
+	}
 	start := end.Add(-duration)
-	_, span := t.tracer.otel.Start(nil, name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
+	_, span := t.tracer.otel.Start(context.Background(), name, trace.WithTimestamp(start), trace.WithSpanKind(trace.SpanKindClient))
 	span.SetAttributes(attrs...)
 	span.SetAttributes(t.commonAttrs...)
 	if error {

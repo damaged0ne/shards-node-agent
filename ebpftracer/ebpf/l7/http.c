@@ -59,3 +59,22 @@ int is_http_response(char *buf, __s32 *status) {
     *status = (b[9]-'0')*100 + (b[10]-'0')*10 + (b[11]-'0');
     return 1;
 }
+
+// 1xx responses except for "101 Switching Protocols" are interim: the final response follows.
+static __always_inline
+int is_http_interim_status(__s32 status) {
+    return status >= 100 && status < 200 && status != 101;
+}
+
+#define HTTP_100_CONTINUE_SIZE 25 // "HTTP/1.1 100 Continue\r\n\r\n"
+
+static __always_inline
+int is_http_100_continue(char *buf) {
+    char b[HTTP_100_CONTINUE_SIZE];
+    if (bpf_probe_read(&b, sizeof(b), (void *)buf)) {
+        return 0;
+    }
+    return b[9] == '1' && b[10] == '0' && b[11] == '0' && b[12] == ' ' &&
+           b[13] == 'C' && b[20] == 'e' &&
+           b[21] == '\r' && b[22] == '\n' && b[23] == '\r' && b[24] == '\n';
+}

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coroot/coroot-node-agent/api"
@@ -37,16 +38,22 @@ const (
 var (
 	constLabels labels.Labels
 	httpClient  = http.Client{
-		Timeout: UploadTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: api.TlsConfig(*flags.CAFile, *flags.InsecureSkipVerify),
-		},
+		Timeout:   UploadTimeout,
+		Transport: newTransport(),
 	}
 	endpointUrl       *url.URL
 	session           ebpfspy.Session
 	targetFinder      = &TargetFinder{processes: map[uint32]*processInfo{}}
 	profilingUpdateCh chan<- *containers.ProfilingUpdate
 )
+
+// newTransport returns a clone of http.DefaultTransport (which honors HTTP(S)_PROXY/NO_PROXY)
+// with the agent's TLS config.
+func newTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = api.TlsConfig(*flags.CAFile, *flags.InsecureSkipVerify)
+	return t
+}
 
 func Init(hostId, hostName string) (chan<- containers.ProcessInfo, chan *containers.ProfilingUpdate) {
 	updateCh := make(chan *containers.ProfilingUpdate, 100)
@@ -111,7 +118,8 @@ func Init(hostId, hostName string) (chan<- containers.ProcessInfo, chan *contain
 	}
 	go collect()
 
-	processInfoCh := make(chan containers.ProcessInfo)
+	// Buffered so that the containers registry event loop is not blocked while the consumer is busy.
+	processInfoCh := make(chan containers.ProcessInfo, 1000)
 	targetFinder.start(processInfoCh)
 	return processInfoCh, updateCh
 }
@@ -120,7 +128,7 @@ func Start() {
 	if session == nil {
 		return
 	}
-	targetFinder.now = time.Now().UnixNano()
+	targetFinder.now.Store(time.Now().UnixNano())
 	session.UpdateTargets(sd.TargetsOptions{})
 }
 
@@ -134,6 +142,7 @@ func collect() {
 	ticker := time.NewTicker(CollectInterval)
 	defer ticker.Stop()
 	for t := range ticker.C {
+		targetFinder.removeDeadProcesses()
 		session.UpdateTargets(sd.TargetsOptions{})
 		bs := pprof.NewProfileBuilders(pprof.BuildersOptions{SampleRate: SampleRate, PerPIDProfile: false})
 		if err := pprof.Collect(bs, session); err != nil {
@@ -410,7 +419,7 @@ func post(u url.URL, q url.Values, body *bytes.Buffer) error {
 type TargetFinder struct {
 	processes map[uint32]*processInfo
 	lock      sync.Mutex
-	now       int64
+	now       atomic.Int64
 }
 
 func (tf *TargetFinder) start(processInfoCh <-chan containers.ProcessInfo) {
@@ -433,45 +442,89 @@ func (tf *TargetFinder) start(processInfoCh <-chan containers.ProcessInfo) {
 	}()
 }
 
+// FindTarget is called by the profiling session. It must not hold tf.lock during slow operations
+// (reading process binaries, JVM perfmap dumps) since the lock is shared with the consumer of
+// processInfoCh, which is fed by the containers registry event loop.
 func (tf *TargetFinder) FindTarget(pid uint32) *sd.Target {
+	now := tf.now.Load()
 	tf.lock.Lock()
-	defer tf.lock.Unlock()
 	pi := tf.processes[pid]
 	if pi == nil {
+		tf.lock.Unlock()
 		return nil
 	}
-	if tf.now-pi.startedAt < int64(CollectInterval) {
+	if now-pi.startedAt < int64(CollectInterval) {
+		tf.lock.Unlock()
 		return nil
 	}
-	var err error
-	if !pi.initialized {
-		pi.initialized = true
+	needInit := !pi.initialized
+	pi.initialized = true // claimed by this call, results are stored below
+	pflags := pi.flags
+	tf.lock.Unlock()
+
+	if needInit {
+		var isJvm, perfmapSupported, isGo bool
+		var mbucketsAddr uint64
 		cmdline := proc.GetCmdline(pid)
 		if proc.IsJvm(cmdline) {
-			pi.isJvm = jvm.IsHotSpotJVM(pid)
-			if !pi.flags.EbpfProfilingDisabled {
-				pi.jvmPerfmapDumpSupported = jvm.IsPerfmapDumpSupported(cmdline)
+			isJvm = jvm.IsHotSpotJVM(pid)
+			if !pflags.EbpfProfilingDisabled {
+				perfmapSupported = jvm.IsPerfmapDumpSupported(cmdline)
 			}
-			klog.Infof("JVM detected PID: %d, hotspot: %t, perfmap: %t", pid, pi.isJvm, pi.jvmPerfmapDumpSupported)
+			klog.Infof("JVM detected PID: %d, hotspot: %t, perfmap: %t", pid, isJvm, perfmapSupported)
 		}
-		if *flags.GoHeapProfilerMode != "disabled" && !pi.flags.EbpfProfilingDisabled {
+		if *flags.GoHeapProfilerMode != "disabled" && !pflags.EbpfProfilingDisabled {
 			if addr, err := findMbucketsAddr(pid, *flags.GoHeapProfilerMode); err == nil {
-				pi.isGo = true
-				pi.mbucketsAddr = addr
+				isGo = true
+				mbucketsAddr = addr
 				klog.Infof("Go heap profiling enabled for PID: %d, mbuckets at 0x%x", pid, addr)
 			}
 		}
+		tf.lock.Lock()
+		pi.isJvm = isJvm
+		pi.jvmPerfmapDumpSupported = perfmapSupported
+		pi.isGo = isGo
+		pi.mbucketsAddr = mbucketsAddr
+		tf.lock.Unlock()
 	}
-	if pi.flags.EbpfProfilingDisabled {
+	if pflags.EbpfProfilingDisabled {
 		return nil
 	}
-	if pi.jvmPerfmapDumpSupported && pi.lastPerfmapDump != tf.now {
-		pi.lastPerfmapDump = tf.now
-		if err = jvm.DumpPerfmap(pid); err != nil {
+
+	tf.lock.Lock()
+	dump := pi.jvmPerfmapDumpSupported && pi.lastPerfmapDump != now
+	if dump {
+		pi.lastPerfmapDump = now
+	}
+	target := pi.target
+	tf.lock.Unlock()
+
+	if dump {
+		if err := jvm.DumpPerfmap(pid); err != nil {
 			klog.Warningln(err)
 		}
 	}
-	return pi.target
+	return target
+}
+
+// removeDeadProcesses drops processes that no longer exist. RemoveDeadPID notifications from the
+// profiling session may be lost, so the map is also swept periodically.
+func (tf *TargetFinder) removeDeadProcesses() {
+	pids, err := proc.ListPids()
+	if err != nil {
+		return
+	}
+	alive := make(map[uint32]struct{}, len(pids))
+	for _, pid := range pids {
+		alive[pid] = struct{}{}
+	}
+	tf.lock.Lock()
+	for pid := range tf.processes {
+		if _, ok := alive[pid]; !ok {
+			delete(tf.processes, pid)
+		}
+	}
+	tf.lock.Unlock()
 }
 
 func (tf *TargetFinder) RemoveDeadPID(pid uint32) {
@@ -489,7 +542,7 @@ func (tf *TargetFinder) DebugInfo() []map[string]string {
 }
 
 func (tf *TargetFinder) Update(_ sd.TargetsOptions) {
-	tf.now = time.Now().UnixNano()
+	tf.now.Store(time.Now().UnixNano())
 }
 
 type processInfo struct {
