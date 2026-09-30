@@ -79,6 +79,7 @@ int sched_process_exit(struct trace_event_raw_sched_process_template__stub *args
 {
     __u64 id = bpf_get_current_pid_tgid();
     bpf_map_delete_elem(&ssl_last_fd, &id);
+    bpf_map_delete_elem(&python_thread_locks, &id);
     __u64 pid = id >> 32;
     if (pid != (__u32)id) { // skipping threads for the rest
         return 0;

@@ -111,6 +111,23 @@ struct {
     __uint(max_entries, 32768);
 } active_l7_requests SEC(".maps");
 
+// Removes pending (not yet answered) L7 requests of a connection. It must be called whenever the fd
+// is closed or reused for a new connection: otherwise a request left over from the previous connection
+// would be matched with a response on the new one, resulting in a huge fake latency.
+// Requests keyed by a protocol-level stream id (Cassandra, DNS) are evicted by the LRU.
+static __always_inline
+void delete_pending_l7_requests(__u32 pid, __u64 fd) {
+    struct l7_request_key k = {
+        .fd = fd,
+        .pid = pid,
+        .is_tls = 0,
+        .stream_id = -1,
+    };
+    bpf_map_delete_elem(&active_l7_requests, &k);
+    k.is_tls = 1;
+    bpf_map_delete_elem(&active_l7_requests, &k);
+}
+
 SEC("tracepoint/sock/inet_sock_set_state")
 int inet_sock_set_state(void *ctx)
 {
@@ -244,16 +261,7 @@ int sys_exit_connect(struct trace_event_raw_sys_exit__stub* ctx) {
         bpf_map_update_elem(&active_connections, &cid, &conn, BPF_ANY);
     }
 
-    struct l7_request_key k = {
-        .fd = cid.fd,
-        .pid = cid.pid,
-        .is_tls = 0,
-        .stream_id = -1,
-    };
-    bpf_map_delete_elem(&active_l7_requests, &k);
-
-    k.is_tls = 1;
-    bpf_map_delete_elem(&active_l7_requests, &k);
+    delete_pending_l7_requests(cid.pid, cid.fd);
 
     bpf_map_delete_elem(&fd_by_pid_tgid, &id);
     return 0;
@@ -282,6 +290,9 @@ int sys_enter_close(void *ctx) {
         bpf_perf_event_output(ctx, &tcp_connect_events, BPF_F_CURRENT_CPU, &e, sizeof(e));
         bpf_map_delete_elem(&active_connections, &cid);
     }
+    // unconditionally: the connection may have been evicted from active_connections (LRU)
+    // or removed by the agent while a request was still pending
+    delete_pending_l7_requests(cid.pid, cid.fd);
     return 0;
 }
 
@@ -298,6 +309,7 @@ int handle_accept_exit(long int ret) {
     conn.timestamp = bpf_ktime_get_ns();
     conn.is_inbound = 1;
     bpf_map_update_elem(&active_connections, &cid, &conn, BPF_ANY);
+    delete_pending_l7_requests(cid.pid, cid.fd); // the fd might have been reused without close() being traced
     return 0;
 }
 
