@@ -14,4 +14,13 @@ var (
 
 	ShardsContainerHealth = metric("shards_container_health", "Docker healthcheck status of the container (series present with value 1 for the current status)", "status")
 	ShardsComposeInfo     = metric("shards_compose_info", "Docker Compose project and service of the container", "project", "service")
+
+	ShardsNftCounterBytes   = metric("shards_nft_counter_bytes_total", "Bytes matched by a named nftables counter", "family", "table", "counter")
+	ShardsNftCounterPackets = metric("shards_nft_counter_packets_total", "Packets matched by a named nftables counter", "family", "table", "counter")
+	ShardsNftRuleBytes      = metric("shards_nft_rule_bytes_total", "Bytes matched by nftables rules with a counter and a comment", "family", "table", "chain", "comment")
+	ShardsNftRulePackets    = metric("shards_nft_rule_packets_total", "Packets matched by nftables rules with a counter and a comment", "family", "table", "chain", "comment")
+
+	ShardsF2bUp     = metric("shards_f2b_up", "1 if the fail2ban database could be read")
+	ShardsF2bBanned = metric("shards_f2b_banned", "Number of currently banned IPs", "jail")
+	ShardsF2bBans1h = metric("shards_f2b_bans_1h", "Number of bans issued during the last hour", "jail")
 )

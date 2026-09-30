@@ -22,6 +22,7 @@ import (
 	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/profiling"
 	"github.com/coroot/coroot-node-agent/prom"
+	"github.com/coroot/coroot-node-agent/shards"
 	"github.com/coroot/coroot-node-agent/tracing"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -146,6 +147,7 @@ func main() {
 		klog.Exitln(err)
 	}
 	registerer.MustRegister(info("node_agent_info", version))
+	registerer.MustRegister(shards.NewCollector())
 
 	if md := nodeCollector.Metadata(); md != nil {
 		region := md.Region

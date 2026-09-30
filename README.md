@@ -23,6 +23,11 @@ Fork-specific code lives in `*shards*.go` files to keep upstream merges simple.
 | `shards_load1`, `shards_load5`, `shards_load15` | Load averages |
 | `shards_container_health{status}` | Docker healthcheck status (`healthy`, `unhealthy`, `starting`), only for containers with a healthcheck |
 | `shards_compose_info{project,service}` | Docker Compose project and service of the container |
+| `shards_nft_counter_{bytes,packets}_total{family,table,counter}` | Named nftables counters, read over netlink in the host network namespace |
+| `shards_nft_rule_{bytes,packets}_total{family,table,chain,comment}` | nftables rules that have both a `counter` and a `comment` (rules sharing a comment in a chain are summed) |
+| `shards_f2b_up` | 1 if the fail2ban database could be read (absent when fail2ban isn't installed) |
+| `shards_f2b_banned{jail}`, `shards_f2b_bans_1h{jail}` | Currently banned IPs and bans issued during the last hour, per enabled jail (fail2ban >= 0.11) |
+| `--disable-nftables-monitoring`, `--disable-fail2ban-monitoring`, `--fail2ban-db` | Collector switches and the fail2ban database path on the host (default `/var/lib/fail2ban/fail2ban.sqlite3`) |
 
 ## Features
 
