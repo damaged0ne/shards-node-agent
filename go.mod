@@ -1,6 +1,6 @@
 module github.com/coroot/coroot-node-agent
 
-go 1.24.7
+go 1.27.1
 
 require (
 	github.com/0xrawsec/golang-etw v1.6.2
@@ -17,6 +17,7 @@ require (
 	github.com/gobwas/glob v0.2.3
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/golang/snappy v0.0.4
+	github.com/google/nftables v0.3.0
 	github.com/google/pprof v0.0.0-20260202012954-cb029daf43ef
 	github.com/google/winops v0.0.0-20260218212338-878c3f651658
 	github.com/grafana/jfr-parser v0.15.0
@@ -52,6 +53,7 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 	inet.af/netaddr v0.0.0-20230525184311-b8eac61e914a
 	k8s.io/klog/v2 v2.130.1
+	modernc.org/sqlite v1.46.1
 )
 
 require (
@@ -117,7 +119,6 @@ require (
 	github.com/google/gnostic-models v0.6.8 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
-	github.com/google/nftables v0.3.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gopacket/gopacket v1.3.1 // indirect
 	github.com/grafana/regexp v0.0.0-20221123153739-15dc172cd2db // indirect
@@ -127,7 +128,6 @@ require (
 	github.com/ianlancetaylor/demangle v0.0.0-20250417193237-f615e6bd150b // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/josharian/native v1.1.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/liggitt/tabwriter v0.0.0-20181228230101-89fcab3d43de // indirect
@@ -218,7 +218,6 @@ require (
 	modernc.org/libc v1.67.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.46.1 // indirect
 	sigs.k8s.io/controller-runtime v0.20.1 // indirect
 	sigs.k8s.io/gateway-api v1.2.1 // indirect
 	sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 // indirect
