@@ -66,10 +66,7 @@ func Init(hostId, hostName string) (chan<- containers.ProcessInfo, chan *contain
 	}
 	klog.Infoln("profiles endpoint:", endpointUrl.String())
 
-	constLabels = labels.Labels{
-		{Name: "host.name", Value: hostName},
-		{Name: "host.id", Value: hostId},
-	}
+	constLabels = labels.FromStrings("host.name", hostName, "host.id", hostId)
 
 	reg := prometheus.NewRegistry()
 	so := ebpfspy.SessionOptions{
@@ -172,20 +169,17 @@ func collect() {
 func upload(b *pprof.ProfileBuilder) error {
 	u := *endpointUrl
 	q := u.Query()
-	for _, l := range b.Labels {
+	b.Labels.Range(func(l labels.Label) {
 		switch l.Name {
 		case "service_name":
-			l.Name = "service.name"
+			q.Set("service.name", l.Value)
 		case "__container_id__":
-			l.Name = "container.id"
-		default:
-			continue
+			q.Set("container.id", l.Value)
 		}
+	})
+	constLabels.Range(func(l labels.Label) {
 		q.Set(l.Name, l.Value)
-	}
-	for _, l := range constLabels {
-		q.Set(l.Name, l.Value)
-	}
+	})
 
 	b.Profile.SampleType[0].Type = "ebpf:cpu:nanoseconds"
 	b.Profile.DurationNanos = CollectInterval.Nanoseconds()
@@ -379,9 +373,9 @@ func uploadProfile(prof *pprofProfile.Profile, serviceName, containerID string) 
 	q := u.Query()
 	q.Set("service.name", serviceName)
 	q.Set("container.id", containerID)
-	for _, l := range constLabels {
+	constLabels.Range(func(l labels.Label) {
 		q.Set(l.Name, l.Value)
-	}
+	})
 
 	prof = pruneProfile(prof, *flags.ProfilesPruneFraction)
 
