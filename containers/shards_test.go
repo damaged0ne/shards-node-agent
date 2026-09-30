@@ -147,3 +147,64 @@ func TestDockerCollectorEmit(t *testing.T) {
 		"shards_container_restart_policy container_id=/docker/cron policy=no":                                                           1,
 	}, got)
 }
+
+func TestReleaseVersion(t *testing.T) {
+	for _, tc := range []struct {
+		summary  container.Summary
+		expected string
+	}{
+		{container.Summary{Image: "mimir:1.4.2", Labels: map[string]string{"org.opencontainers.image.version": "1.5.0"}}, "1.5.0"},
+		{container.Summary{Image: "registry.local:5000/mimir:1.4.2"}, "1.4.2"},
+		{container.Summary{Image: "mimir:1.4.2@sha256:ffff"}, "1.4.2"},
+		{container.Summary{Image: "registry.local:5000/mimir", ImageID: "sha256:0123456789abcdef"}, "0123456789ab"},
+	} {
+		assert.Equal(t, tc.expected, releaseVersion(tc.summary), tc.summary.Image)
+	}
+}
+
+func TestReleaseWindow(t *testing.T) {
+	prev := *flags.ReleaseWindow
+	*flags.ReleaseWindow = 30 * time.Minute
+	t.Cleanup(func() { *flags.ReleaseWindow = prev })
+
+	now := time.Unix(1_790_000_000, 0)
+	c := newDockerCollector(nil)
+	c.listedAt = now
+	c.now = func() time.Time { return now }
+	created := func(ago time.Duration) int64 { return now.Add(-ago).Unix() }
+	oneoff := map[string]string{"com.docker.compose.oneoff": "True"}
+	c.containers = []dockerContainer{
+		{id: "/swarm/p/fresh/1", summary: container.Summary{Created: created(10 * time.Minute), Image: "fresh:2", ImageID: "sha256:a"}},
+		{id: "/swarm/p/old/1", summary: container.Summary{Created: created(time.Hour), Image: "old:1"}},
+		{id: "/swarm/p/slow/1", summary: container.Summary{Created: created(time.Hour), Image: "slow:3", ImageID: "sha256:b",
+			Labels: map[string]string{"shards.release-window": "2h"}}},
+		{id: "/swarm/p/quiet/1", summary: container.Summary{Created: created(time.Minute), Image: "quiet:1",
+			Labels: map[string]string{"shards.release-window": "0"}}},
+		{id: "/swarm/p/job-run/abc", summary: container.Summary{Created: created(time.Minute), Image: "job:1", Labels: oneoff}},
+	}
+	ch := make(chan prometheus.Metric, 100)
+	c.Collect(ch)
+	close(ch)
+	windows := map[string]float64{}
+	created_ := 0
+	for m := range ch {
+		desc := m.Desc().String()
+		var d dto.Metric
+		require.NoError(t, m.Write(&d))
+		switch {
+		case strings.Contains(desc, `"shards_release_window"`):
+			key := ""
+			for _, l := range d.Label {
+				key += l.GetName() + "=" + l.GetValue() + " "
+			}
+			windows[strings.TrimSpace(key)] = d.GetGauge().GetValue()
+		case strings.Contains(desc, `"shards_container_created_seconds"`):
+			created_++
+		}
+	}
+	assert.Equal(t, 5, created_)
+	assert.Equal(t, map[string]float64{
+		"container_id=/swarm/p/fresh/1 image_id=sha256:a version=2": (20 * time.Minute).Seconds(),
+		"container_id=/swarm/p/slow/1 image_id=sha256:b version=3":  time.Hour.Seconds(),
+	}, windows)
+}

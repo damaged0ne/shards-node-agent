@@ -22,7 +22,8 @@ import (
 // Shards fork: Docker Compose grouping and Docker-level container metrics.
 
 const (
-	shardsIgnoreLabel = "shards.ignore"
+	shardsIgnoreLabel  = "shards.ignore"
+	releaseWindowLabel = "shards.release-window"
 
 	composeProjectLabel = "com.docker.compose.project"
 	composeServiceLabel = "com.docker.compose.service"
@@ -77,6 +78,8 @@ type dockerCollector struct {
 
 	labelKeys []string
 	labelDesc *prometheus.Desc
+
+	now func() time.Time
 }
 
 type dockerContainer struct {
@@ -99,7 +102,7 @@ type dockerInspect struct {
 var invalidLabelChars = regexp.MustCompile(`[^a-zA-Z0-9_]`)
 
 func newDockerCollector(labels []string) *dockerCollector {
-	c := &dockerCollector{inspected: map[string]*dockerInspect{}}
+	c := &dockerCollector{inspected: map[string]*dockerInspect{}, now: time.Now}
 	seen := map[string]bool{}
 	var names []string
 	for _, l := range labels {
@@ -263,6 +266,18 @@ func (c *dockerCollector) emit(ch chan<- prometheus.Metric, dc dockerContainer) 
 	}
 	ch <- metrics.Gauge(metrics.ShardsContainerImageInfo, 1, id, s.Image, s.ImageID,
 		labels["org.opencontainers.image.version"], labels["org.opencontainers.image.revision"])
+	if s.Created > 0 {
+		created := time.Unix(s.Created, 0)
+		ch <- metrics.Gauge(metrics.ShardsContainerCreated, float64(s.Created), id)
+		// one-off `compose run` containers are jobs, not releases
+		if !strings.EqualFold(labels[composeOneoffLabel], "true") {
+			if w := releaseWindow(labels); w > 0 {
+				if left := created.Add(w).Sub(c.now()); left > 0 {
+					ch <- metrics.Gauge(metrics.ShardsReleaseWindow, left.Seconds(), id, releaseVersion(s), s.ImageID)
+				}
+			}
+		}
+	}
 	if c.labelDesc != nil {
 		values := []string{id}
 		for _, k := range c.labelKeys {
@@ -311,4 +326,37 @@ func dockerHealthStatus(c container.Summary) container.HealthStatus {
 		return container.Starting
 	}
 	return ""
+}
+
+// releaseWindow returns the window set with the shards.release-window label (e.g. "45m", "0" disables),
+// falling back to --release-window.
+func releaseWindow(labels map[string]string) time.Duration {
+	if v := labels[releaseWindowLabel]; v != "" {
+		if v == "0" {
+			return 0
+		}
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+	}
+	return *flags.ReleaseWindow
+}
+
+// releaseVersion prefers the OCI version label, then the image tag, then the short image id.
+func releaseVersion(s container.Summary) string {
+	if v := s.Labels["org.opencontainers.image.version"]; v != "" {
+		return v
+	}
+	image := s.Image
+	if i := strings.Index(image, "@"); i >= 0 {
+		image = image[:i]
+	}
+	if i := strings.LastIndex(image, ":"); i >= 0 && !strings.Contains(image[i:], "/") {
+		return image[i+1:]
+	}
+	id := strings.TrimPrefix(s.ImageID, "sha256:")
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	return id
 }

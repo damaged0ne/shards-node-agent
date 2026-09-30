@@ -17,3 +17,7 @@ var (
 	ComposeGrouping = kingpin.Flag("compose-grouping", "Report Docker Compose containers as /swarm/<project>/<service>/<number> so that Coroot groups replicas into one application per service (--no-compose-grouping reports them as /docker/<name>)").Default("true").Envar(envar("COMPOSE_GROUPING")).Bool()
 	ContainerLabels = kingpin.Flag("container-labels", "Docker labels to export as labels of the shards_container_labels metric").Envar(envar("CONTAINER_LABELS")).Strings()
 )
+
+var (
+	ReleaseWindow = kingpin.Flag("release-window", "How long a (re)created container is reported as being in its release window, can be overridden per container with the shards.release-window label (0 disables)").Default("30m").Envar(envar("RELEASE_WINDOW")).Duration()
+)

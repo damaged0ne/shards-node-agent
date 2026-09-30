@@ -31,6 +31,8 @@ Fork-specific code lives in `*shards*.go` files to keep upstream merges simple.
 | `shards_container_docker_restarts`, `shards_container_restart_policy{policy}` | dockerd restart count and restart policy |
 | `shards_container_image_info{container_id,image,image_id,version,revision}` | Image, with version and revision from the `org.opencontainers.image.*` labels |
 | `shards_compose_info{container_id,project,service}` | Docker Compose project and service of the container |
+| `shards_container_created_seconds` | Unix time the container was created. Compose recreates containers only on image or config changes, restarts and reboots keep it |
+| `shards_release_window{container_id,version,image_id}` | Present during the release window after a container is (re)created, the value is the seconds left. `--release-window` (default `30m`, `RELEASE_WINDOW`) sets the length, the `shards.release-window` label overrides it per service (`"2h"`, `"0"` disables). One-off `compose run` containers are excluded. `version` comes from the OCI version label, then the image tag, then the short image id |
 | `shards_nft_counter_{bytes,packets}_total{family,table,counter}` | Named nftables counters, read over netlink in the host network namespace |
 | `shards_nft_rule_{bytes,packets}_total{family,table,chain,comment}` | nftables rules that have both a `counter` and a `comment` (rules sharing a comment in a chain are summed) |
 | `shards_f2b_up` | 1 if the fail2ban database could be read (absent when fail2ban isn't installed) |

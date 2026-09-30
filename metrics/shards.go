@@ -22,6 +22,8 @@ var (
 	ShardsContainerFinished      = metric("shards_container_finished_seconds", "Unix time the container last finished (only for containers that aren't running)", "container_id")
 	ShardsContainerDockerRestart = metric("shards_container_docker_restarts", "Number of times dockerd restarted the container according to its restart policy", "container_id")
 	ShardsContainerRestartPolicy = metric("shards_container_restart_policy", "Restart policy of the container", "container_id", "policy")
+	ShardsContainerCreated       = metric("shards_container_created_seconds", "Unix time the container was created (Compose recreates containers on image or config changes)", "container_id")
+	ShardsReleaseWindow          = metric("shards_release_window", "Present while the container is within the release window after it was (re)created, the value is the number of seconds left", "container_id", "version", "image_id")
 	ShardsContainerImageInfo     = metric("shards_container_image_info", "Image of the container, version and revision come from the OCI image labels", "container_id", "image", "image_id", "version", "revision")
 
 	ShardsNftCounterBytes   = metric("shards_nft_counter_bytes_total", "Bytes matched by a named nftables counter", "family", "table", "counter")
