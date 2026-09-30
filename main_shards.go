@@ -7,6 +7,7 @@ import (
 
 	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/coroot/coroot-node-agent/shards/probes"
 	"github.com/coroot/coroot-node-agent/shards/promagent"
 	"github.com/coroot/coroot-node-agent/shards/relay"
 	"github.com/prometheus/client_golang/prometheus"
@@ -14,11 +15,25 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// startShards starts the fork's Prometheus agent (scraping of local targets).
+// startShards starts the fork's Prometheus agent (scraping of local targets) and synthetic probes.
 // It returns the gatherer to expose on /metrics and a function that stops them.
 func startShards(registry *prometheus.Registry, registerer prometheus.Registerer, hostname string) (prometheus.Gatherer, func()) {
 	var gatherer prometheus.Gatherer = registry
 	var stops []func()
+
+	if *flags.ProbeConfigFile != "" {
+		cfg, err := probes.LoadFile(*flags.ProbeConfigFile, *flags.ScrapeInterval)
+		if err != nil {
+			klog.Exitln(err)
+		}
+		r := probes.NewRunner(cfg)
+		if err = registerer.Register(r); err != nil {
+			klog.Exitln(err)
+		}
+		r.Start()
+		klog.Infof("running %d probe(s)", len(cfg.Probes))
+		stops = append(stops, r.Stop)
+	}
 
 	if a, selfReg := startScraping(hostname); a != nil {
 		// A few of the agent's internal metrics are pushed to Coroot with the node-agent's own metrics,
