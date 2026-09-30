@@ -143,6 +143,9 @@ func main() {
 		klog.Exitln(err)
 	}
 	registerer.MustRegister(info("node_agent_info", version))
+	if err := common.RegisterAgentMetrics(registerer); err != nil {
+		klog.Exitln(err)
+	}
 
 	if md := nodeCollector.Metadata(); md != nil {
 		region := md.Region
