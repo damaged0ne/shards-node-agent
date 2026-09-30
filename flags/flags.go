@@ -50,6 +50,8 @@ var (
 	WalDir         = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default(defaultWalDir).Envar(envar("WAL_DIR")).String()
 	MaxSpoolSize   = kingpin.Flag("max-spool-size", "Maximum size of the on-disk spool used to buffer data when it cannot be sent to collector. Supports size suffixes like KB, MB, or GB.").Default("500MB").Envar(envar("MAX_SPOOL_SIZE")).Bytes()
 
+	EnablePprof = kingpin.Flag("enable-pprof", "Expose Go pprof debug handlers (/debug/pprof/) on the listen address").Default("false").Envar(envar("ENABLE_PPROF")).Bool()
+
 	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
 	Version      = "unknown"
 )

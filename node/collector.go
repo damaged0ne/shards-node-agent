@@ -54,4 +54,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.NodeNetTxPackets
 	ch <- metrics.NodeNetInterfaceUp
 	ch <- metrics.NodeNetInterfaceIP
+	ch <- NodePsiCPU
+	ch <- NodePsiMemory
+	ch <- NodePsiIO
 }

@@ -51,11 +51,9 @@ func (m *dotNetMetric) units() string {
 }
 
 type DotNetMonitor struct {
-	pid            uint32
-	appName        string
-	cancel         context.CancelFunc
-	lastUpdate     time.Time
-	runtimeVersion string
+	pid        uint32
+	appName    string
+	lastUpdate time.Time
 
 	info                          *prometheus.GaugeVec
 	memoryAllocatedBytes          prometheus.Counter
