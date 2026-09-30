@@ -1,6 +1,9 @@
 package node
 
 import (
+	"errors"
+	"syscall"
+
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -71,6 +74,20 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- metrics.Gauge(metrics.NodeMemoryFree, mem.FreeBytes)
 		ch <- metrics.Gauge(metrics.NodeMemoryAvailable, mem.AvailableBytes)
 		ch <- metrics.Gauge(metrics.NodeMemoryCached, mem.CachedBytes)
+	}
+
+	for resource, desc := range map[string]*prometheus.Desc{"cpu": NodePsiCPU, "memory": NodePsiMemory, "io": NodePsiIO} {
+		p, err := pressure(procRoot, resource)
+		if err != nil {
+			// missing on kernels without PSI, EOPNOTSUPP when booted with psi=0
+			if !common.IsNotExist(err) && !errors.Is(err, syscall.EOPNOTSUPP) {
+				klog.Errorln(err)
+			}
+			continue
+		}
+		for kind, v := range p {
+			ch <- metrics.Counter(desc, v, kind)
+		}
 	}
 
 	disks, err := GetDisks()

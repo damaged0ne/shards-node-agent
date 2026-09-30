@@ -1,7 +1,7 @@
 package node
 
 import (
-	"io/ioutil"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -12,7 +12,7 @@ import (
 func memoryInfo(procRoot string) (MemoryStat, error) {
 	mem := MemoryStat{}
 
-	data, err := ioutil.ReadFile(path.Join(procRoot, "meminfo"))
+	data, err := os.ReadFile(path.Join(procRoot, "meminfo"))
 	if err != nil {
 		return mem, err
 	}

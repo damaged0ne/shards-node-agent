@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -84,9 +86,56 @@ func whitelistNodeExternalNetworks() {
 	}
 }
 
-func main() {
-	klog.LogToStderr(false)
+// ready is set once the agent has initialized its core components (see /readyz).
+var ready atomic.Bool
+
+func initLogging() {
+	// By default, klog writes a message to the output of its own severity and of every lower
+	// severity (so a warning is written twice and an error four times when all severities share
+	// one output), and additionally copies ERROR+ messages directly to stderr.
+	// Write each message exactly once, through the rate-limited output.
+	fs := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(fs)
+	for k, v := range map[string]string{
+		"logtostderr":     "false",
+		"alsologtostderr": "false",
+		"one_output":      "true",
+		"stderrthreshold": "4", // above FATAL: never write directly to stderr
+	} {
+		if err := fs.Set(k, v); err != nil {
+			klog.Warningf("failed to set klog flag %s=%s: %s", k, v, err)
+		}
+	}
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
+}
+
+func newHttpMux(registry *prometheus.Registry, registerer prometheus.Registerer) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	if *flags.EnablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+	return mux
+}
+
+func main() {
+	initLogging()
 
 	klog.Infoln("agent version:", version)
 
@@ -171,11 +220,11 @@ func main() {
 	}, machineId, systemUuid); err != nil {
 		klog.Exitln(err)
 	}
+	ready.Store(true)
 
-	http.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
 	klog.Infoln("listening on:", *flags.ListenAddress)
 
-	srv := &http.Server{Addr: *flags.ListenAddress}
+	srv := &http.Server{Addr: *flags.ListenAddress, Handler: newHttpMux(registry, registerer), ReadHeaderTimeout: 10 * time.Second}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -200,7 +249,10 @@ func main() {
 		defer close(done)
 		cr.Close()
 		profiling.Stop()
-		logs.Shutdown(context.Background())
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer flushCancel()
+		logs.Shutdown(flushCtx)
+		tracing.Shutdown(flushCtx)
 	}()
 
 	select {
@@ -231,6 +283,10 @@ type RateLimitedLogOutput struct {
 }
 
 func (o *RateLimitedLogOutput) Write(data []byte) (int, error) {
+	// ERROR and FATAL messages are never dropped (they used to bypass the limiter via klog's stderr threshold).
+	if len(data) > 0 && (data[0] == 'E' || data[0] == 'F') {
+		return os.Stderr.Write(data)
+	}
 	if !o.limiter.Allow() {
 		return len(data), nil
 	}

@@ -35,8 +35,6 @@ func VersionFromString(version string) (Version, error) {
 			v.Minor = ii
 		case 2:
 			v.Patch = ii
-		default:
-			break
 		}
 	}
 	return v, nil
