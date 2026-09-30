@@ -56,6 +56,10 @@ func (t ContainerType) String() string {
 		return "lxc"
 	case ContainerTypeSystemdService:
 		return "systemd"
+	case ContainerTypeSandbox:
+		return "sandbox"
+	case ContainerTypeTalosRuntime:
+		return "talos"
 	default:
 		return "unknown"
 	}
@@ -133,7 +137,7 @@ func NewFromProcessCgroupFile(filePath string) (*Cgroup, error) {
 			cgPath := parts[2]
 			if strings.HasPrefix(parts[2], "/lxc.payload.") {
 				pp := strings.Split(cgPath, "/")
-				if len(parts) > 2 {
+				if len(pp) > 1 {
 					cgPath = "/" + pp[1]
 				}
 			}
@@ -164,7 +168,8 @@ func containerByCgroup(cgroupPath string) (ContainerType, string, error) {
 		return ContainerTypeTalosRuntime, "/talos/init", nil
 	case prefix == "user.slice" || prefix == "init.scope" || prefix == "systemd":
 		return ContainerTypeStandaloneProcess, "", nil
-	case prefix == "docker" || (prefix == "system.slice" && len(parts) > 1 && strings.HasPrefix(parts[1], "docker-")):
+	case prefix == "docker" || (prefix == "system.slice" && len(parts) > 1 && strings.HasPrefix(parts[1], "docker-")) ||
+		(prefix == "ecstasks.slice" && strings.HasPrefix(parts[len(parts)-1], "docker-")): // Amazon ECS: /ecstasks.slice/ecstasks-<task>.slice/docker-<id>.scope
 		matches := dockerIdRegexp.FindStringSubmatch(cgroupPath)
 		if matches == nil {
 			return ContainerTypeUnknown, "", fmt.Errorf("invalid docker cgroup %s", cgroupPath)

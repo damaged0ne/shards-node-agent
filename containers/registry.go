@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ type Registry struct {
 
 	tracer *ebpftracer.Tracer
 	events chan ebpftracer.Event
+	done   chan struct{} // closed when the event loop exits
 
 	containersById         map[ContainerID]*Container
 	containersByCgroupId   map[string]*Container
@@ -85,14 +87,18 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 	defer hostNetNs.Close()
 	hostNetNsId = hostNetNs.UniqueId()
 
-	err = proc.ExecuteInNetNs(hostNetNs, selfNetNs, func() error {
-		if err := TaskstatsInit(); err != nil {
-			return err
+	if *flags.DisableDelayAccounting {
+		klog.Infoln("delay accounting (taskstats) is disabled")
+	} else {
+		err = proc.ExecuteInNetNs(hostNetNs, selfNetNs, func() error {
+			if err := TaskstatsInit(); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	if err = cgroup.Init(); err != nil {
 		return nil, err
@@ -113,6 +119,7 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 	r := &Registry{
 		reg:                    reg,
 		events:                 make(chan ebpftracer.Event, 10000),
+		done:                   make(chan struct{}),
 		containersById:         map[ContainerID]*Container{},
 		containersByCgroupId:   map[string]*Container{},
 		containersByPid:        map[uint32]*Container{},
@@ -148,6 +155,8 @@ func (r *Registry) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (r *Registry) Collect(ch chan<- prometheus.Metric) {
+	common.AgentEventsQueueLength.Set(float64(len(r.events)))
+
 	r.ip2fqdnLock.RLock()
 	defer r.ip2fqdnLock.RUnlock()
 	for ip, domain := range r.ip2fqdn {
@@ -157,12 +166,16 @@ func (r *Registry) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
+// Close stops the tracer, which guarantees that nothing is sent to r.events after it returns,
+// and then stops the event loop.
 func (r *Registry) Close() {
 	r.tracer.Close()
 	close(r.events)
+	<-r.done
 }
 
 func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
+	defer close(r.done)
 	gcTicker := time.NewTicker(gcInterval)
 	defer gcTicker.Stop()
 	tlsAttachTicker := time.NewTicker(tlsAttachRetryInterval)
@@ -257,92 +270,106 @@ func (r *Registry) handleEvents(ch <-chan ebpftracer.Event) {
 			}
 		case sample := <-r.gpuProcessUsageSampleChan:
 			if c := r.containersByPid[sample.Pid]; c != nil {
-				if p := c.processes[sample.Pid]; p != nil {
-					p.addGpuUsageSample(sample)
-				}
+				c.onGpuUsageSample(sample)
 			}
 		case e, more := <-ch:
 			if !more {
 				return
 			}
-			switch e.Type {
-			case ebpftracer.EventTypeProcessStart:
-				c, seen := r.containersByPid[e.Pid]
-				switch { // possible pids wraparound + missed `process-exit` event
-				case c == nil && seen: // ignored
-					delete(r.containersByPid, e.Pid)
-				case c != nil: // revalidating by cgroup
-					cg, err := proc.ReadCgroup(e.Pid)
-					if err != nil || cg.Id != c.cgroup.Id {
-						delete(r.containersByPid, e.Pid)
-						c.onProcessExit(e.Pid, false)
-					}
-				}
-				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					p := c.ensureProcess(e.Pid)
-					if r.processInfoCh != nil && p != nil {
-						r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}
-					}
-				}
-			case ebpftracer.EventTypeProcessExit:
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill)
-				}
+			r.handleEvent(e)
+		}
+	}
+}
+
+// handleEvent processes a single eBPF event. A panic here (e.g., caused by a malformed payload)
+// is recovered, so that it doesn't bring down the whole agent.
+func (r *Registry) handleEvent(e ebpftracer.Event) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			common.AgentRecoveredPanics.WithLabelValues("event_handler").Inc()
+			klog.Errorf("panic while handling %v event of pid %d: %v\n%s", e.Type, e.Pid, rec, debug.Stack())
+		}
+	}()
+	switch e.Type {
+	case ebpftracer.EventTypeProcessStart:
+		c, seen := r.containersByPid[e.Pid]
+		switch { // possible pids wraparound + missed `process-exit` event
+		case c == nil && seen: // ignored
+			delete(r.containersByPid, e.Pid)
+		case c != nil: // revalidating by cgroup
+			cg, err := proc.ReadCgroup(e.Pid)
+			if err != nil || cg.Id != c.cgroup.Id {
 				delete(r.containersByPid, e.Pid)
-				delete(r.pendingTlsAttach, e.Pid)
-
-			case ebpftracer.EventTypeFileOpen:
-				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					c.onFileOpen(e.Pid, e.Fd, e.Mnt, e.Log)
-				}
-
-			case ebpftracer.EventTypeListenOpen:
-				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					c.onListenOpen(e.Pid, e.SrcAddr, false)
-					c.attachTlsUprobes(r.tracer, e.Pid, false)
-					delete(r.pendingTlsAttach, e.Pid)
-				} else {
-					klog.Infoln("TCP listen open from unknown container", e)
-				}
-			case ebpftracer.EventTypeListenClose:
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.onListenClose(e.Pid, e.SrcAddr)
-				}
-
-			case ebpftracer.EventTypeConnectionOpen:
-				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
-					if !c.attachTlsUprobes(r.tracer, e.Pid, true) {
-						r.pendingTlsAttach[e.Pid] = c
-					}
-				}
-			case ebpftracer.EventTypeConnectionError:
-				if c := r.getOrCreateContainer(e.Pid); c != nil {
-					c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
-				}
-			case ebpftracer.EventTypeConnectionClose:
-				if c := r.containersByPid[e.Pid]; c != nil {
-					c.onConnectionClose(e)
-				}
-			case ebpftracer.EventTypeTCPRetransmit:
-				for _, c := range r.containersById {
-					if c.onRetransmission(e.SrcAddr, e.DstAddr) {
-						break
-					}
-				}
-			case ebpftracer.EventTypeL7Request:
-				if e.L7Request == nil {
-					continue
-				}
-				if c := r.containersByPid[e.Pid]; c != nil {
-					ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request)
-					r.ip2fqdnLock.Lock()
-					for ip, domain := range ip2fqdn {
-						r.ip2fqdn[ip] = domain
-					}
-					r.ip2fqdnLock.Unlock()
+				c.onProcessExit(e.Pid, false)
+			}
+		}
+		if c := r.getOrCreateContainer(e.Pid); c != nil {
+			p := c.ensureProcess(e.Pid)
+			if r.processInfoCh != nil && p != nil {
+				select {
+				case r.processInfoCh <- ProcessInfo{Pid: p.Pid, ContainerId: c.id, StartedAt: p.StartedAt, Flags: p.Flags}:
+				default:
+					klog.Warningln("profiling is too slow to accept process info, skipping pid", p.Pid)
 				}
 			}
+		}
+	case ebpftracer.EventTypeProcessExit:
+		if c := r.containersByPid[e.Pid]; c != nil {
+			c.onProcessExit(e.Pid, e.Reason == ebpftracer.EventReasonOOMKill)
+		}
+		delete(r.containersByPid, e.Pid)
+		delete(r.pendingTlsAttach, e.Pid)
+
+	case ebpftracer.EventTypeFileOpen:
+		if c := r.getOrCreateContainer(e.Pid); c != nil {
+			c.onFileOpen(e.Pid, e.Fd, e.Mnt, e.Log)
+		}
+
+	case ebpftracer.EventTypeListenOpen:
+		if c := r.getOrCreateContainer(e.Pid); c != nil {
+			c.onListenOpen(e.Pid, e.SrcAddr, false)
+			c.attachTlsUprobes(r.tracer, e.Pid, false)
+			delete(r.pendingTlsAttach, e.Pid)
+		} else {
+			klog.Infoln("TCP listen open from unknown container", e)
+		}
+	case ebpftracer.EventTypeListenClose:
+		if c := r.containersByPid[e.Pid]; c != nil {
+			c.onListenClose(e.Pid, e.SrcAddr)
+		}
+
+	case ebpftracer.EventTypeConnectionOpen:
+		if c := r.getOrCreateContainer(e.Pid); c != nil {
+			c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, e.Timestamp, false, e.Duration)
+			if !c.attachTlsUprobes(r.tracer, e.Pid, true) {
+				r.pendingTlsAttach[e.Pid] = c
+			}
+		}
+	case ebpftracer.EventTypeConnectionError:
+		if c := r.getOrCreateContainer(e.Pid); c != nil {
+			c.onConnectionOpen(e.Pid, e.Fd, e.SrcAddr, e.DstAddr, e.ActualDstAddr, 0, true, e.Duration)
+		}
+	case ebpftracer.EventTypeConnectionClose:
+		if c := r.containersByPid[e.Pid]; c != nil {
+			c.onConnectionClose(e)
+		}
+	case ebpftracer.EventTypeTCPRetransmit:
+		for _, c := range r.containersById {
+			if c.onRetransmission(e.SrcAddr, e.DstAddr) {
+				break
+			}
+		}
+	case ebpftracer.EventTypeL7Request:
+		if e.L7Request == nil {
+			return
+		}
+		if c := r.containersByPid[e.Pid]; c != nil {
+			ip2fqdn := c.onL7Request(e.Pid, e.Fd, e.Timestamp, e.L7Request)
+			r.ip2fqdnLock.Lock()
+			for ip, domain := range ip2fqdn {
+				r.ip2fqdn[ip] = domain
+			}
+			r.ip2fqdnLock.Unlock()
 		}
 	}
 }
@@ -363,6 +390,9 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	if err != nil {
 		if !common.IsNotExist(err) {
 			klog.Warningln("failed to read proc cgroup:", err)
+			// e.g., an unknown cgroup layout: don't re-read and re-log it on every event of this process
+			t := time.Now()
+			r.containersByPidIgnored[pid] = &t
 		}
 		return nil
 	}
@@ -419,14 +449,21 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 
 	if c := r.containersById[id]; c != nil {
 		klog.Warningln("id conflict:", id)
-		if cg.CreatedAt().After(c.cgroup.CreatedAt()) {
+		c.lock.Lock()
+		updated := cg.CreatedAt().After(c.cgroup.CreatedAt())
+		if updated {
 			c.cgroup = cg
 			c.metadata = md
-			c.runLogParser("")
 		}
+		c.lock.Unlock()
 		r.containersByPid[pid] = c
 		r.containersByCgroupId[cg.Id] = c
 		c.ensureProcess(pid)
+		if updated {
+			c.lock.Lock()
+			c.runLogParser("")
+			c.lock.Unlock()
+		}
 		return c
 	}
 	c, err := NewContainer(id, cg, md, pid, r)
@@ -443,6 +480,9 @@ func (r *Registry) getOrCreateContainer(pid uint32) *Container {
 	r.containersByCgroupId[cg.Id] = c
 	r.containersById[id] = c
 	c.ensureProcess(pid)
+	c.lock.Lock()
+	c.runLogParser("")
+	c.lock.Unlock()
 	return c
 }
 
@@ -481,22 +521,35 @@ func (r *Registry) gcActiveConnections() {
 	}
 }
 
+// send delivers a stats update to the event loop. It returns false if the event loop has exited.
+func send[T any](r *Registry, ch chan<- T, v T) bool {
+	select {
+	case ch <- v:
+		return true
+	case <-r.done:
+		return false
+	}
+}
+
 func (r *Registry) updateTrafficStats() {
 	iter := r.tracer.ActiveConnectionsIterator()
 	cid := ebpftracer.ConnectionId{}
 	stats := ebpftracer.Connection{}
 	for iter.Next(&cid, &stats) {
-		r.trafficStatsUpdateCh <- &TrafficStatsUpdate{
+		u := &TrafficStatsUpdate{
 			Pid:           cid.PID,
 			FD:            cid.FD,
 			BytesSent:     stats.BytesSent,
 			BytesReceived: stats.BytesReceived,
 		}
+		if !send(r, r.trafficStatsUpdateCh, u) {
+			return
+		}
 	}
 	if err := iter.Err(); err != nil {
 		klog.Warningln(err)
 	}
-	r.trafficStatsUpdateCh <- nil
+	send(r, r.trafficStatsUpdateCh, nil)
 }
 
 func (r *Registry) updateNodejsStats() {
@@ -505,13 +558,15 @@ func (r *Registry) updateNodejsStats() {
 	stats := ebpftracer.NodejsStats{}
 
 	for iter.Next(&pid, &stats) {
-		r.nodejsStatsUpdateCh <- &NodejsStatsUpdate{Pid: uint32(pid), Stats: stats}
+		if !send(r, r.nodejsStatsUpdateCh, &NodejsStatsUpdate{Pid: uint32(pid), Stats: stats}) {
+			return
+		}
 	}
 
 	if err := iter.Err(); err != nil {
 		klog.Warningln(err)
 	}
-	r.nodejsStatsUpdateCh <- nil
+	send(r, r.nodejsStatsUpdateCh, nil)
 }
 
 func (r *Registry) updatePythonStats() {
@@ -520,13 +575,15 @@ func (r *Registry) updatePythonStats() {
 	stats := ebpftracer.PythonStats{}
 
 	for iter.Next(&pid, &stats) {
-		r.pythonStatsUpdateCh <- &PythonStatsUpdate{Pid: uint32(pid), Stats: stats}
+		if !send(r, r.pythonStatsUpdateCh, &PythonStatsUpdate{Pid: uint32(pid), Stats: stats}) {
+			return
+		}
 	}
 
 	if err := iter.Err(); err != nil {
 		klog.Warningln(err)
 	}
-	r.pythonStatsUpdateCh <- nil
+	send(r, r.pythonStatsUpdateCh, nil)
 }
 
 func (r *Registry) getDomain(ip netaddr.IP) *common.Domain {
