@@ -94,6 +94,9 @@ func main() {
 	if err != nil {
 		klog.Exitln("failed to get uname:", err)
 	}
+	if *flags.HostnameOverride != "" {
+		hostname = *flags.HostnameOverride
+	}
 	klog.Infoln("hostname:", hostname)
 	klog.Infoln("kernel version:", kv)
 

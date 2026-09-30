@@ -54,4 +54,13 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- metrics.NodeNetTxPackets
 	ch <- metrics.NodeNetInterfaceUp
 	ch <- metrics.NodeNetInterfaceIP
+
+	ch <- metrics.ShardsFsSize
+	ch <- metrics.ShardsFsAvail
+	ch <- metrics.ShardsFsFiles
+	ch <- metrics.ShardsFsFilesFree
+	ch <- metrics.ShardsFsReadonly
+	ch <- metrics.ShardsLoad1
+	ch <- metrics.ShardsLoad5
+	ch <- metrics.ShardsLoad15
 }

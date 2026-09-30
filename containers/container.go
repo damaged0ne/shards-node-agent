@@ -271,6 +271,8 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		ch <- metrics.Gauge(metrics.ContainerInfo, 1, c.metadata.image, c.metadata.systemd.TriggeredBy, c.metadata.systemd.Type)
 	}
 
+	c.collectShards(ch)
+
 	ch <- metrics.Counter(metrics.Restarts, float64(c.restarts))
 
 	if cpu := c.cgroup.CpuStat(); cpu != nil {

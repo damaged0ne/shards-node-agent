@@ -10,6 +10,20 @@ The kernel must also be built with `CONFIG_BPF_EVENTS=y` (kprobe and tracepoint 
 
 <img src="https://coroot.com/static/img/blog/ebpf.svg" width="800" />
 
+## Shards fork additions
+
+Fork-specific code lives in `*shards*.go` files to keep upstream merges simple.
+
+| Flag / metric | Description |
+|---|---|
+| `--hostname-override` (`HOSTNAME_OVERRIDE`) | Hostname reported in `node_info`, logs, traces and profiles instead of the host's UTS hostname |
+| `shards_fs_size_bytes`, `shards_fs_avail_bytes` | Filesystem size / space available to non-root users, per host mount (`mount`, `device`, `fs`) |
+| `shards_fs_files`, `shards_fs_files_free` | Total / free inodes per host mount |
+| `shards_fs_readonly` | 1 if the mount is read-only |
+| `shards_load1`, `shards_load5`, `shards_load15` | Load averages |
+| `shards_container_health{status}` | Docker healthcheck status (`healthy`, `unhealthy`, `starting`), only for containers with a healthcheck |
+| `shards_compose_info{project,service}` | Docker Compose project and service of the container |
+
 ## Features
 
 ### TCP connection tracing
