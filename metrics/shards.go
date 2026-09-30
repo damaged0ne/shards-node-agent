@@ -12,8 +12,17 @@ var (
 	ShardsLoad5  = metric("shards_load5", "5m load average")
 	ShardsLoad15 = metric("shards_load15", "15m load average")
 
-	ShardsContainerHealth = metric("shards_container_health", "Docker healthcheck status of the container (series present with value 1 for the current status)", "status")
-	ShardsComposeInfo     = metric("shards_compose_info", "Docker Compose project and service of the container", "project", "service")
+	// Docker-level container metrics include exited containers, so container_id is a regular label here.
+	ShardsContainerHealth        = metric("shards_container_health", "Docker healthcheck status of the container (series present with value 1 for the current status)", "container_id", "status")
+	ShardsComposeInfo            = metric("shards_compose_info", "Docker Compose project and service of the container", "container_id", "project", "service")
+	ShardsContainerState         = metric("shards_container_state", "Docker state of the container (series present with value 1 for the current state)", "container_id", "state")
+	ShardsContainerExitCode      = metric("shards_container_exit_code", "Exit code of the last run of a container that isn't running", "container_id")
+	ShardsContainerOOMKilled     = metric("shards_container_oom_killed", "1 if the last run of a container that isn't running was killed by the OOM killer", "container_id")
+	ShardsContainerStarted       = metric("shards_container_started_seconds", "Unix time the container was last started", "container_id")
+	ShardsContainerFinished      = metric("shards_container_finished_seconds", "Unix time the container last finished (only for containers that aren't running)", "container_id")
+	ShardsContainerDockerRestart = metric("shards_container_docker_restarts", "Number of times dockerd restarted the container according to its restart policy", "container_id")
+	ShardsContainerRestartPolicy = metric("shards_container_restart_policy", "Restart policy of the container", "container_id", "policy")
+	ShardsContainerImageInfo     = metric("shards_container_image_info", "Image of the container, version and revision come from the OCI image labels", "container_id", "image", "image_id", "version", "revision")
 
 	ShardsNftCounterBytes   = metric("shards_nft_counter_bytes_total", "Bytes matched by a named nftables counter", "family", "table", "counter")
 	ShardsNftCounterPackets = metric("shards_nft_counter_packets_total", "Packets matched by a named nftables counter", "family", "table", "counter")

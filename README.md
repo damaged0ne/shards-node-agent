@@ -21,8 +21,16 @@ Fork-specific code lives in `*shards*.go` files to keep upstream merges simple.
 | `shards_fs_files`, `shards_fs_files_free` | Total / free inodes per host mount |
 | `shards_fs_readonly` | 1 if the mount is read-only |
 | `shards_load1`, `shards_load5`, `shards_load15` | Load averages |
-| `shards_container_health{status}` | Docker healthcheck status (`healthy`, `unhealthy`, `starting`), only for containers with a healthcheck |
-| `shards_compose_info{project,service}` | Docker Compose project and service of the container |
+| `--compose-grouping` (default on, `COMPOSE_GROUPING`) | Docker Compose containers are reported as `/swarm/<project>/<service>/<number>`, so Coroot shows one application per service (namespace = project) instead of one per replica. One-off `docker compose run` containers become `/swarm/<project>/<service>-run/<suffix>`. `--no-compose-grouping` restores `/docker/<name>` |
+| `shards.ignore=true` Docker label | The container isn't monitored |
+| `--container-labels` (`CONTAINER_LABELS`) | Docker labels exported by `shards_container_labels{container_id,label_<name>...}` (names sanitized, e.g. `team` -> `label_team`) |
+| `shards_container_state{container_id,state}` | Docker state: `running`, `exited`, `restarting`, `paused`, `created`, `dead`, `removing` (includes stopped containers) |
+| `shards_container_health{container_id,status}` | Docker healthcheck status (`healthy`, `unhealthy`, `starting`) of running containers with a healthcheck |
+| `shards_container_exit_code`, `shards_container_oom_killed` | Result of the last run of a container that isn't running |
+| `shards_container_started_seconds`, `shards_container_finished_seconds` | Unix time of the last start / finish |
+| `shards_container_docker_restarts`, `shards_container_restart_policy{policy}` | dockerd restart count and restart policy |
+| `shards_container_image_info{container_id,image,image_id,version,revision}` | Image, with version and revision from the `org.opencontainers.image.*` labels |
+| `shards_compose_info{container_id,project,service}` | Docker Compose project and service of the container |
 | `shards_nft_counter_{bytes,packets}_total{family,table,counter}` | Named nftables counters, read over netlink in the host network namespace |
 | `shards_nft_rule_{bytes,packets}_total{family,table,chain,comment}` | nftables rules that have both a `counter` and a `comment` (rules sharing a comment in a chain are summed) |
 | `shards_f2b_up` | 1 if the fail2ban database could be read (absent when fail2ban isn't installed) |
