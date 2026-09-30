@@ -10,6 +10,35 @@ The kernel must also be built with `CONFIG_BPF_EVENTS=y` (kprobe and tracepoint 
 
 <img src="https://coroot.com/static/img/blog/ebpf.svg" width="800" />
 
+## Shards fork additions
+
+Fork-specific code lives in `*shards*.go` files to keep upstream merges simple.
+
+| Flag / metric | Description |
+|---|---|
+| `--hostname-override` (`HOSTNAME_OVERRIDE`) | Hostname reported in `node_info`, logs, traces and profiles instead of the host's UTS hostname |
+| `shards_fs_size_bytes`, `shards_fs_avail_bytes` | Filesystem size / space available to non-root users, per host mount (`mount`, `device`, `fs`) |
+| `shards_fs_files`, `shards_fs_files_free` | Total / free inodes per host mount |
+| `shards_fs_readonly` | 1 if the mount is read-only |
+| `shards_load1`, `shards_load5`, `shards_load15` | Load averages |
+| `--compose-grouping` (default on, `COMPOSE_GROUPING`) | Docker Compose containers are reported as `/swarm/<project>/<service>/<number>`, so Coroot shows one application per service (namespace = project) instead of one per replica. One-off `docker compose run` containers become `/swarm/<project>/<service>-run/<suffix>`. `--no-compose-grouping` restores `/docker/<name>` |
+| `shards.ignore=true` Docker label | The container isn't monitored |
+| `--container-labels` (`CONTAINER_LABELS`) | Docker labels exported by `shards_container_labels{container_id,label_<name>...}` (names sanitized, e.g. `team` -> `label_team`) |
+| `shards_container_state{container_id,state}` | Docker state: `running`, `exited`, `restarting`, `paused`, `created`, `dead`, `removing` (includes stopped containers) |
+| `shards_container_health{container_id,status}` | Docker healthcheck status (`healthy`, `unhealthy`, `starting`) of running containers with a healthcheck |
+| `shards_container_exit_code`, `shards_container_oom_killed` | Result of the last run of a container that isn't running |
+| `shards_container_started_seconds`, `shards_container_finished_seconds` | Unix time of the last start / finish |
+| `shards_container_docker_restarts`, `shards_container_restart_policy{policy}` | dockerd restart count and restart policy |
+| `shards_container_image_info{container_id,image,image_id,version,revision}` | Image, with version and revision from the `org.opencontainers.image.*` labels |
+| `shards_compose_info{container_id,project,service}` | Docker Compose project and service of the container |
+| `shards_container_created_seconds` | Unix time the container was created. Compose recreates containers only on image or config changes, restarts and reboots keep it |
+| `shards_release_window{container_id,version,image_id}` | Present during the release window after a container is (re)created, the value is the seconds left. `--release-window` (default `30m`, `RELEASE_WINDOW`) sets the length, the `shards.release-window` label overrides it per service (`"2h"`, `"0"` disables). One-off `compose run` containers are excluded. `version` comes from the OCI version label, then the image tag, then the short image id |
+| `shards_nft_counter_{bytes,packets}_total{family,table,counter}` | Named nftables counters, read over netlink in the host network namespace |
+| `shards_nft_rule_{bytes,packets}_total{family,table,chain,comment}` | nftables rules that have both a `counter` and a `comment` (rules sharing a comment in a chain are summed) |
+| `shards_f2b_up` | 1 if the fail2ban database could be read (absent when fail2ban isn't installed) |
+| `shards_f2b_banned{jail}`, `shards_f2b_bans_1h{jail}` | Currently banned IPs and bans issued during the last hour, per enabled jail (fail2ban >= 0.11) |
+| `--disable-nftables-monitoring`, `--disable-fail2ban-monitoring`, `--fail2ban-db` | Collector switches and the fail2ban database path on the host (default `/var/lib/fail2ban/fail2ban.sqlite3`) |
+
 ## Features
 
 ### TCP connection tracing

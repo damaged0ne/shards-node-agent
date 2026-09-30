@@ -24,6 +24,7 @@ import (
 	"github.com/coroot/coroot-node-agent/node/metadata"
 	"github.com/coroot/coroot-node-agent/profiling"
 	"github.com/coroot/coroot-node-agent/prom"
+	"github.com/coroot/coroot-node-agent/shards"
 	"github.com/coroot/coroot-node-agent/tracing"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -143,6 +144,9 @@ func main() {
 	if err != nil {
 		klog.Exitln("failed to get uname:", err)
 	}
+	if *flags.HostnameOverride != "" {
+		hostname = *flags.HostnameOverride
+	}
 	klog.Infoln("hostname:", hostname)
 	klog.Infoln("kernel version:", kv)
 
@@ -192,6 +196,7 @@ func main() {
 		klog.Exitln(err)
 	}
 	registerer.MustRegister(info("node_agent_info", version))
+	registerer.MustRegister(shards.NewCollector())
 	if err := common.RegisterAgentMetrics(registerer); err != nil {
 		klog.Exitln(err)
 	}

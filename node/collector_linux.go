@@ -120,6 +120,8 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			}
 		}
 	}
+	collectShards(ch)
+
 	ch <- metrics.Gauge(metrics.NodeCloudInfo, 1,
 		string(c.instanceMetadata.Provider), c.instanceMetadata.AccountId, c.instanceMetadata.InstanceId,
 		c.instanceMetadata.InstanceType, c.instanceMetadata.LifeCycle,

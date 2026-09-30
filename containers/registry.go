@@ -105,6 +105,8 @@ func NewRegistry(reg prometheus.Registerer, processInfoCh chan<- ProcessInfo, pr
 	}
 	if err = DockerdInit(); err != nil {
 		klog.Warningln(err)
+	} else if err = reg.Register(newDockerCollector(*flags.ContainerLabels)); err != nil {
+		return nil, err
 	}
 	if err = ContainerdInit(); err != nil {
 		klog.Warningln(err)
@@ -605,7 +607,7 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 	default:
 		return ""
 	}
-	if cg.ContainerId == "" {
+	if cg.ContainerId == "" || shardsIgnored(md) {
 		return ""
 	}
 	if md.labels["io.kubernetes.pod.name"] != "" {
@@ -648,6 +650,9 @@ func calcId(cg *cgroup.Cgroup, md *ContainerMetadata) ContainerID {
 		if allocId != "" && group != "" && job != "" && namespace != "" && task != "" {
 			return ContainerID(fmt.Sprintf("/nomad/%s/%s/%s/%s/%s", namespace, job, group, allocId, task))
 		}
+	}
+	if id := composeContainerId(md); id != "" {
+		return id
 	}
 	if md.name == "" { // should be "pure" dockerd container here
 		klog.Warningln("empty dockerd container name for:", cg.ContainerId)
