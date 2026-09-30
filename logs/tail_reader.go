@@ -14,6 +14,10 @@ import (
 
 var (
 	tailPollInterval = time.Second
+
+	// tailMaxLineSize bounds the size of a partially read line kept in memory while waiting for its end.
+	// When exceeded, the accumulated data is emitted as a separate entry.
+	tailMaxLineSize = 1 << 20
 )
 
 type TailReader struct {
@@ -42,9 +46,11 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 	}
 	if r.file != nil { // the file may not exist yet, poll() waits for it to appear
 		if r.info, err = r.file.Stat(); err != nil {
+			_ = r.file.Close()
 			return nil, err
 		}
 		if _, err = r.file.Seek(0, io.SeekEnd); err != nil {
+			_ = r.file.Close()
 			return nil, err
 		}
 		r.reader = bufio.NewReader(r.file)
@@ -52,6 +58,12 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 
 	go func() {
 		var prefix string
+		flush := func() {
+			if prefix != "" {
+				r.emit(prefix)
+				prefix = ""
+			}
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -59,29 +71,41 @@ func NewTailReader(fileName string, ch chan<- logparser.LogEntry) (*TailReader, 
 				return
 			default:
 				if r.reader == nil {
-					r.poll(ctx)
+					if r.poll(ctx) {
+						// the partial line belongs to the previous file (or its truncated content)
+						flush()
+					}
 					continue
 				}
 				line, err := r.reader.ReadString('\n')
 				if err != nil {
-					prefix = line
-					r.poll(ctx)
+					prefix += line
+					if len(prefix) >= tailMaxLineSize {
+						flush()
+					}
+					if r.poll(ctx) {
+						flush()
+					}
 					continue
 				}
 				if prefix != "" {
 					line = prefix + line
 					prefix = ""
 				}
-				r.ch <- logparser.LogEntry{
-					Timestamp: time.Now(),
-					Content:   strings.TrimSuffix(line, "\n"),
-					Level:     logparser.LevelUnknown,
-				}
+				r.emit(strings.TrimSuffix(line, "\n"))
 			}
 		}
 	}()
 
 	return r, nil
+}
+
+func (r *TailReader) emit(content string) {
+	r.ch <- logparser.LogEntry{
+		Timestamp: time.Now(),
+		Content:   content,
+		Level:     logparser.LevelUnknown,
+	}
 }
 
 func (r *TailReader) Stop() {
@@ -93,13 +117,15 @@ func (r *TailReader) Stop() {
 	}
 }
 
-func (r *TailReader) poll(ctx context.Context) {
+// poll waits until there is new data to read. It returns true if the reader has been switched
+// to a new file or rewound because of truncation, i.e., any previously read partial line is stale.
+func (r *TailReader) poll(ctx context.Context) bool {
 	ticker := time.NewTicker(tailPollInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-ticker.C:
 			if info, err := os.Stat(r.fileName); err != nil {
 				if r.file != nil {
@@ -115,11 +141,15 @@ func (r *TailReader) poll(ctx context.Context) {
 					r.file = f
 					r.info = info
 					r.reader = bufio.NewReader(r.file)
-					return
+					return true
 				}
-				if r.moved(info) || r.truncated(info) || r.appended(info) {
+				if r.moved(info) || r.truncated(info) {
 					r.info = info
-					return
+					return true
+				}
+				if r.appended(info) {
+					r.info = info
+					return false
 				}
 			}
 		}
@@ -129,11 +159,12 @@ func (r *TailReader) poll(ctx context.Context) {
 func (r *TailReader) moved(info os.FileInfo) bool {
 	if !os.SameFile(r.info, info) {
 		f, err := os.Open(r.fileName)
+		_ = r.file.Close()
 		if err != nil {
 			r.file = nil
+			r.reader = nil
 			return false
 		}
-		_ = r.file.Close()
 		r.file = f
 		r.reader = bufio.NewReader(r.file)
 		return true
@@ -147,6 +178,7 @@ func (r *TailReader) truncated(info os.FileInfo) bool {
 	}
 	if info.Size() < r.info.Size() {
 		if _, err := r.file.Seek(0, io.SeekStart); err == nil {
+			r.reader.Reset(r.file)
 			return true
 		}
 	}
