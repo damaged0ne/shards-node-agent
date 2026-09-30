@@ -1,7 +1,7 @@
 package node
 
 import (
-	"io/ioutil"
+	"os"
 	"path"
 	"regexp"
 	"strconv"
@@ -16,7 +16,7 @@ var (
 
 func cpuStat(procRoot string) (CpuStat, error) {
 	stat := CpuStat{}
-	data, err := ioutil.ReadFile(path.Join(procRoot, "stat"))
+	data, err := os.ReadFile(path.Join(procRoot, "stat"))
 	if err != nil {
 		return stat, err
 	}

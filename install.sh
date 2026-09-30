@@ -137,6 +137,21 @@ setup_binary() {
     info "Installing coroot-node-agent to ${BIN_DIR}/coroot-node-agent"
     $SUDO chown root:root ${TMP_BIN}
     $SUDO mv -f ${TMP_BIN} ${BIN_DIR}/coroot-node-agent
+    setup_selinux
+}
+
+# The binary is downloaded to a temporary directory and moved, so it keeps the temporary file's
+# SELinux label (e.g. user_tmp_t), which prevents systemd from executing it (issue #80).
+# Restore the default label for BIN_DIR (bin_t).
+setup_selinux() {
+    command -v getenforce >/dev/null 2>&1 || return 0
+    [ "$(getenforce 2>/dev/null)" = "Disabled" ] && return 0
+    if command -v restorecon >/dev/null 2>&1; then
+        info "Restoring SELinux context of ${BIN_DIR}/coroot-node-agent"
+        $SUDO restorecon -v ${BIN_DIR}/coroot-node-agent || info "restorecon failed, the agent may fail to start if SELinux is enforcing"
+    else
+        info "SELinux is enabled but restorecon is not found, the agent may fail to start"
+    fi
 }
 
 download() {

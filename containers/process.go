@@ -14,7 +14,6 @@ import (
 	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/jpillora/backoff"
-	"github.com/mdlayher/taskstats"
 )
 
 type GpuUsage struct {
@@ -38,10 +37,14 @@ type Process struct {
 	ctx        context.Context
 	cancelFunc context.CancelFunc
 
-	tracer        *ebpftracer.Tracer
+	tracer *ebpftracer.Tracer
+
+	// lock protects the fields set by the instrument goroutine: dotNetMonitor, nodejsPrevStats and pythonPrevStats
+	lock          sync.Mutex
 	dotNetMonitor *DotNetMonitor
-	isGolangApp   bool
-	isRustApp     bool
+
+	isGolangApp bool
+	isRustApp   bool
 
 	uprobeKeys            []ebpftracer.UprobeKey
 	uprobeKeysLock        sync.Mutex
@@ -66,8 +69,8 @@ type inboundHttp2State struct {
 	connTimestamp uint64
 }
 
-func NewProcess(pid uint32, stats *taskstats.Stats, tracer *ebpftracer.Tracer) *Process {
-	p := &Process{Pid: pid, StartedAt: stats.BeginTime, tracer: tracer, instrumentDone: make(chan struct{})}
+func NewProcess(pid uint32, startedAt time.Time, tracer *ebpftracer.Tracer) *Process {
+	p := &Process{Pid: pid, StartedAt: startedAt, tracer: tracer, instrumentDone: make(chan struct{})}
 	p.Flags, _ = proc.GetFlags(pid)
 	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
 	go p.instrument(tracer)
@@ -117,12 +120,19 @@ func (p *Process) instrument(tracer *ebpftracer.Tracer) {
 				p.instrumentNodejs(dest, tracer)
 				if dotNetAppName, err := dotNetApp(cmdline, p.Pid); err == nil {
 					if dotNetAppName != "" {
-						p.dotNetMonitor = NewDotNetMonitor(p.ctx, p.Pid, dotNetAppName)
+						m := NewDotNetMonitor(p.ctx, p.Pid, dotNetAppName)
+						p.lock.Lock()
+						p.dotNetMonitor = m
+						p.lock.Unlock()
 					}
 				}
 				return
 			}
-			time.Sleep(b.Duration())
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-time.After(b.Duration()):
+			}
 		}
 	}
 }
@@ -146,7 +156,9 @@ func (p *Process) instrumentPython(cmdline []byte, tracer *ebpftracer.Tracer) {
 		return
 	}
 	if key := tracer.AttachPythonThreadLockProbes(p.Pid); key != nil {
+		p.lock.Lock()
 		p.pythonPrevStats = &ebpftracer.PythonStats{}
+		p.lock.Unlock()
 		p.addUprobeKey(*key)
 	}
 }
@@ -160,9 +172,17 @@ func (p *Process) instrumentNodejs(exe string, tracer *ebpftracer.Tracer) {
 		return
 	}
 	if key := tracer.AttachNodejsProbes(p.Pid, exe); key != nil {
+		p.lock.Lock()
 		p.nodejsPrevStats = &ebpftracer.NodejsStats{}
+		p.lock.Unlock()
 		p.addUprobeKey(*key)
 	}
+}
+
+func (p *Process) getDotNetMonitor() *DotNetMonitor {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	return p.dotNetMonitor
 }
 
 func (p *Process) addGpuUsageSample(sample gpu.ProcessUsageSample) {

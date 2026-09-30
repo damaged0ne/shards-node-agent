@@ -102,7 +102,7 @@ func Ping(ns netns.NsHandle, originNs netns.NsHandle, targets []netaddr.IP, time
 		case <-timeoutTicker.C:
 			return rttByIp, nil
 		default:
-			if len(rttByIp) == len(targets) {
+			if len(rttByIp) == len(ids) { // targets skipped due to EAGAIN will never be answered
 				return rttByIp, nil
 			}
 			remoteAddr, echoReply, rxTimestamp, err := receive(conn)

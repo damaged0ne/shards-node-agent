@@ -109,7 +109,7 @@ func (t *Tracer) init(ch chan<- Event) error {
 			var nsConntrack map[connId]netaddr.IPPort
 			if nsId != hostNsId {
 				if nsConntrack, err = getConntrack(ns); err != nil {
-					klog.Warningf("failed to dump conntrack for ns %d: %s", pid, err)
+					klog.Warningf("failed to dump conntrack for ns %s (pid %d): %s", nsId, pid, err)
 				}
 			}
 			if ss, err := proc.GetSockets(pid); err != nil {
@@ -121,7 +121,7 @@ func (t *Tracer) init(ch chan<- Event) error {
 					id := connId{src: s.SAddr, dst: s.DAddr}
 					actualDest, ok := hostConntrack[id]
 					if !ok && nsConntrack != nil {
-						actualDest, ok = nsConntrack[id]
+						actualDest = nsConntrack[id]
 					}
 					sockets[s.Inode] = sock{Sock: s, actualDest: actualDest}
 				}

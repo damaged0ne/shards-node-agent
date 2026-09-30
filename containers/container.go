@@ -13,6 +13,7 @@ import (
 	"github.com/coroot/coroot-node-agent/ebpftracer"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
 	"github.com/coroot/coroot-node-agent/flags"
+	"github.com/coroot/coroot-node-agent/gpu"
 	"github.com/coroot/coroot-node-agent/jvm"
 	"github.com/coroot/coroot-node-agent/logs"
 	"github.com/coroot/coroot-node-agent/metrics"
@@ -30,6 +31,7 @@ import (
 
 var (
 	gcInterval             = 10 * time.Minute
+	closedConnectionsTTL   = 30 * time.Second
 	tlsAttachRetryInterval = 5 * time.Second
 	pingTimeout            = 300 * time.Millisecond
 	gpuStatsWindow         = 15 * time.Second
@@ -206,17 +208,22 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, pid 
 
 		done: make(chan struct{}),
 	}
-	c.runLogParser("")
+	// log parsers are started by the registry once the first process is registered,
+	// so that the COROOT_LOG_MONITORING flag of the process can be taken into account
 
 	go func() {
 		ticker := time.NewTicker(gcInterval)
 		defer ticker.Stop()
+		closedConnectionsTicker := time.NewTicker(closedConnectionsTTL)
+		defer closedConnectionsTicker.Stop()
 		for {
 			select {
 			case <-c.done:
 				return
 			case t := <-ticker.C:
 				c.gc(t)
+			case t := <-closedConnectionsTicker.C:
+				c.gcClosedConnections(t)
 			}
 		}
 	}()
@@ -244,8 +251,19 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	c.registry.updateStatsFromEbpfMapsIfNecessary()
 
 	c.lock.Lock()
-	defer c.lock.Unlock()
+	pt := c.collectLocked(ch)
+	c.lock.Unlock()
 
+	// Pinging may take up to pingTimeout, so it's done without holding the lock
+	// to avoid blocking the event loop that handles this container's events.
+	if pt != nil {
+		for ip, rtt := range pt.run() {
+			ch <- metrics.Gauge(metrics.NetLatency, rtt, ip.String())
+		}
+	}
+}
+
+func (c *Container) collectLocked(ch chan<- prometheus.Metric) *pingTask {
 	if taskstatsClient != nil {
 		deadPids := c.updateDelaysLocked()
 		for _, pid := range deadPids {
@@ -263,7 +281,7 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 			end = c.zombieAt
 		}
 		if end.Sub(since) < minAge {
-			return
+			return nil
 		}
 	}
 
@@ -383,6 +401,11 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		return pids[i] < pids[j]
 	})
 
+	// GPU usage is summed across all the container's processes, so reset it once before the loop.
+	for _, usage := range c.gpuStats {
+		usage.Reset()
+	}
+
 	for _, pid := range pids {
 		process := c.processes[pid]
 		cmdline := proc.GetCmdline(pid)
@@ -413,18 +436,16 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 					ch <- m
 				}
 			}
-		case process.dotNetMonitor != nil:
+		case process.getDotNetMonitor() != nil:
+			dotNetMonitor := process.getDotNetMonitor()
 			appTypes["dotnet"] = struct{}{}
-			appName := process.dotNetMonitor.AppName()
+			appName := dotNetMonitor.AppName()
 			if !seenDotNetApps[appName] {
 				seenDotNetApps[appName] = true
-				process.dotNetMonitor.Collect(ch)
+				dotNetMonitor.Collect(ch)
 			}
 		}
 
-		for _, usage := range c.gpuStats {
-			usage.Reset()
-		}
 		if usage := process.getGPUUsage(); usage != nil {
 			for uuid, u := range usage {
 				tu := c.gpuStats[uuid]
@@ -438,6 +459,10 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	for uuid, usage := range c.gpuStats {
+		if usage.GPU == 0 && usage.Memory == 0 {
+			delete(c.gpuStats, uuid)
+			continue
+		}
 		ch <- metrics.Gauge(metrics.GpuUsagePercent, usage.GPU, uuid)
 		ch <- metrics.Gauge(metrics.GpuMemoryUsagePercent, usage.Memory, uuid)
 	}
@@ -466,10 +491,9 @@ func (c *Container) Collect(ch chan<- prometheus.Metric) {
 	c.l7InboundStats.collect(ch)
 
 	if !*flags.DisablePinger {
-		for ip, rtt := range c.ping() {
-			ch <- metrics.Gauge(metrics.NetLatency, rtt, ip.String())
-		}
+		return c.newPingTask()
 	}
+	return nil
 }
 
 func (c *Container) ensureProcess(pid uint32) *Process {
@@ -485,22 +509,30 @@ func (c *Container) ensureProcess(pid uint32) *Process {
 func (c *Container) onProcessStart(pid uint32) *Process {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	stats, err := TaskstatsPID(pid)
+	startedAt, err := proc.GetStartTime(pid)
 	if err != nil {
 		return nil
 	}
 	c.zombieAt = time.Time{}
-	p := NewProcess(pid, stats, c.registry.tracer)
+	p := NewProcess(pid, startedAt, c.registry.tracer)
 
 	if p == nil {
 		return nil
 	}
 	c.processes[pid] = p
 
+	if p.Flags.LogMonitoringDisabled && len(c.logParsers) > 0 {
+		klog.InfoS("stopping log monitoring due to COROOT_LOG_MONITORING=disabled", "cg", c.cgroup.Id)
+		for source, parser := range c.logParsers {
+			parser.Stop()
+			delete(c.logParsers, source)
+		}
+	}
+
 	if c.startedAt.IsZero() {
-		c.startedAt = stats.BeginTime
+		c.startedAt = startedAt
 	} else {
-		min := stats.BeginTime
+		min := startedAt
 		for _, p := range c.processes {
 			if p.StartedAt.Before(min) {
 				min = p.StartedAt
@@ -625,7 +657,9 @@ func (c *Container) onConnectionOpen(pid uint32, fd uint64, src, dst, actualDst 
 	if common.PortFilter.ShouldBeSkipped(dst.Port()) {
 		return
 	}
+	c.lock.Lock()
 	p := c.processes[pid]
+	c.lock.Unlock()
 	if p == nil {
 		return
 	}
@@ -705,20 +739,19 @@ func (c *Container) onConnectionClose(e ebpftracer.Event) {
 		return
 	}
 	c.lock.Lock()
+	defer c.lock.Unlock()
 	conn := c.connectionsByPidFd[PidFd{Pid: e.Pid, Fd: e.Fd}]
-	c.lock.Unlock()
-	if conn != nil {
-		if conn.Timestamp != 0 && conn.Timestamp != e.Timestamp {
-			return
+	if conn == nil {
+		return
+	}
+	if conn.Timestamp != 0 && conn.Timestamp != e.Timestamp {
+		return
+	}
+	if conn.Closed.IsZero() {
+		if e.TrafficStats != nil {
+			c.updateConnectionTrafficStats(conn, e.TrafficStats.BytesSent, e.TrafficStats.BytesReceived)
 		}
-		if conn.Closed.IsZero() {
-			if e.TrafficStats != nil {
-				c.lock.Lock()
-				c.updateConnectionTrafficStats(conn, e.TrafficStats.BytesSent, e.TrafficStats.BytesReceived)
-				c.lock.Unlock()
-			}
-			conn.Closed = time.Now()
-		}
+		conn.Closed = time.Now()
 	}
 }
 
@@ -841,7 +874,11 @@ func (c *Container) onL7Request(pid uint32, fd uint64, timestamp uint64, r *l7.R
 	}
 	var trace *tracing.Trace
 	if !ebpfTracesDisabled {
-		trace = c.tracer.NewTrace(conn.DestinationKey.ActualDestinationIfKnown())
+		var end time.Time // the time the response was observed by the kernel, zero means now
+		if r.Timestamp != 0 {
+			end = tracing.MonotonicToTime(r.Timestamp)
+		}
+		trace = c.tracer.NewTraceAt(conn.DestinationKey.ActualDestinationIfKnown(), end)
 	}
 	switch r.Protocol {
 	case l7.ProtocolHTTP:
@@ -998,6 +1035,14 @@ func (c *Container) updateDelaysLocked() []uint32 {
 	return deadPids
 }
 
+func (c *Container) onGpuUsageSample(sample gpu.ProcessUsageSample) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if p := c.processes[sample.Pid]; p != nil {
+		p.addGpuUsageSample(sample)
+	}
+}
+
 func (c *Container) updateJvmProfilingStats(u *ProfilingUpdate) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -1025,7 +1070,12 @@ func (c *Container) updateNodejsStats(s NodejsStatsUpdate) {
 	defer c.lock.Unlock()
 
 	p := c.processes[s.Pid]
-	if p == nil || p.nodejsPrevStats == nil {
+	if p == nil {
+		return
+	}
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.nodejsPrevStats == nil {
 		return
 	}
 	if delta := s.Stats.EventLoopBlockedTime - p.nodejsPrevStats.EventLoopBlockedTime; delta > 0 {
@@ -1042,7 +1092,12 @@ func (c *Container) updatePythonStats(s PythonStatsUpdate) {
 	defer c.lock.Unlock()
 
 	p := c.processes[s.Pid]
-	if p == nil || p.pythonPrevStats == nil {
+	if p == nil {
+		return
+	}
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	if p.pythonPrevStats == nil {
 		return
 	}
 	if delta := s.Stats.ThreadLockWaitTime - p.pythonPrevStats.ThreadLockWaitTime; delta > 0 {
@@ -1176,28 +1231,26 @@ func (c *Container) getProxiedListens() map[string]map[netaddr.IPPort]struct{} {
 	return res
 }
 
-func (c *Container) ping() map[netaddr.IP]float64 {
-	netNs := netns.None()
-	for pid := range c.processes {
-		if pid == agentPid {
-			netNs = selfNetNs
-			break
-		}
-		ns, err := proc.GetNetNs(pid)
-		if err != nil {
-			if !common.IsNotExist(err) {
-				klog.Warningln(err)
-			}
-			continue
-		}
-		netNs = ns
-		defer netNs.Close()
-		break
+type pingTask struct {
+	netNs   netns.NsHandle
+	ownNs   bool
+	targets []netaddr.IP
+}
+
+func (pt *pingTask) run() map[netaddr.IP]float64 {
+	if pt.ownNs {
+		defer pt.netNs.Close()
 	}
-	if !netNs.IsOpen() {
+	rtt, err := pinger.Ping(pt.netNs, selfNetNs, pt.targets, pingTimeout)
+	if err != nil {
+		klog.Warningln(err)
 		return nil
 	}
+	return rtt
+}
 
+// newPingTask must be called with c.lock held. The returned task is run without the lock.
+func (c *Container) newPingTask() *pingTask {
 	ips := map[netaddr.IP]struct{}{}
 	for d := range c.connectionStats {
 		if ip := d.ActualDestination().IP(); !ip.IsZero() {
@@ -1209,9 +1262,6 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 			ips[dst.IP()] = struct{}{}
 		}
 	}
-	if len(ips) == 0 {
-		return nil
-	}
 	targets := make([]netaddr.IP, 0, len(ips))
 	for ip := range ips {
 		if ip.IsLoopback() {
@@ -1222,12 +1272,23 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 		}
 		targets = append(targets, ip)
 	}
-	rtt, err := pinger.Ping(netNs, selfNetNs, targets, pingTimeout)
-	if err != nil {
-		klog.Warningln(err)
+	if len(targets) == 0 {
 		return nil
 	}
-	return rtt
+	for pid := range c.processes {
+		if pid == agentPid {
+			return &pingTask{netNs: selfNetNs, targets: targets}
+		}
+		ns, err := proc.GetNetNs(pid)
+		if err != nil {
+			if !common.IsNotExist(err) {
+				klog.Warningln(err)
+			}
+			continue
+		}
+		return &pingTask{netNs: ns, ownNs: true, targets: targets}
+	}
+	return nil
 }
 
 func (c *Container) runLogParser(logPath string) {
@@ -1235,11 +1296,9 @@ func (c *Container) runLogParser(logPath string) {
 		return
 	}
 
-	for _, p := range c.processes {
-		if p.Flags.LogMonitoringDisabled {
-			klog.InfoS("skipping log monitoring due to COROOT_LOG_MONITORING=disabled", "cg", c.cgroup.Id)
-			return
-		}
+	if c.logMonitoringDisabled() {
+		klog.InfoS("skipping log monitoring due to COROOT_LOG_MONITORING=disabled", "cg", c.cgroup.Id)
+		return
 	}
 
 	containerId := string(c.id)
@@ -1294,6 +1353,18 @@ func (c *Container) runLogParser(logPath string) {
 		klog.InfoS("started container logparser", "cg", c.cgroup.Id)
 		c.logParsers["stdout/stderr"] = logs.NewPipeline(parser, reader.Stop)
 	}
+}
+
+func (c *Container) logMonitoringDisabled() bool {
+	if c.metadata != nil && strings.Contains(c.metadata.env["COROOT_LOG_MONITORING"], "disabled") {
+		return true
+	}
+	for _, p := range c.processes {
+		if p.Flags.LogMonitoringDisabled {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Container) gc(now time.Time) {
@@ -1378,6 +1449,29 @@ func (c *Container) gc(now time.Time) {
 	}
 }
 
+// gcClosedConnections drops closed connections shortly after they are closed.
+// A short grace period is kept to account for L7 events that arrive after the close event.
+// Without it, clients that open many short-lived connections accumulate them until the next full gc.
+func (c *Container) gcClosedConnections(now time.Time) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	for k, conn := range c.activeConnections {
+		if conn.Closed.IsZero() || now.Sub(conn.Closed) < closedConnectionsTTL {
+			continue
+		}
+		delete(c.activeConnections, k)
+		pidFd := PidFd{Pid: conn.Pid, Fd: conn.Fd}
+		if conn == c.connectionsByPidFd[pidFd] {
+			delete(c.connectionsByPidFd, pidFd)
+		}
+	}
+	for pidFd, conn := range c.connectionsByPidFd {
+		if !conn.Closed.IsZero() && now.Sub(conn.Closed) >= closedConnectionsTTL {
+			delete(c.connectionsByPidFd, pidFd)
+		}
+	}
+}
+
 func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.IPPort]string) {
 	for addr, byPid := range c.listens {
 		if _, open := actualListens[addr]; open {
@@ -1446,8 +1540,12 @@ func (c *Container) revalidateListens(now time.Time, actualListens map[netaddr.I
 	}
 }
 
+// attachTlsUprobes is called only from the registry's event loop, so the *Checked flags need no locking.
+// The slow attach work is done without holding c.lock; fields read by Collect are set under it.
 func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, canBePostponed bool) bool {
+	c.lock.Lock()
 	p := c.processes[pid]
+	c.lock.Unlock()
 	if p == nil {
 		return true
 	}
@@ -1464,7 +1562,9 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, canB
 	}
 	if !p.goTlsUprobesChecked {
 		key, isGolangApp := tracer.AttachGoTlsUprobes(pid)
+		c.lock.Lock()
 		p.isGolangApp = isGolangApp
+		c.lock.Unlock()
 		if key != nil {
 			p.addUprobeKey(*key)
 		}
@@ -1472,7 +1572,9 @@ func (c *Container) attachTlsUprobes(tracer *ebpftracer.Tracer, pid uint32, canB
 	}
 	if !p.rustlsUprobesChecked {
 		key, isRustApp := tracer.AttachRustlsUprobes(pid)
+		c.lock.Lock()
 		p.isRustApp = isRustApp
+		c.lock.Unlock()
 		if key != nil {
 			p.addUprobeKey(*key)
 		}

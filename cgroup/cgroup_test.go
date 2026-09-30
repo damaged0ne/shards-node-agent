@@ -121,6 +121,11 @@ func TestContainerByCgroup(t *testing.T) {
 	as.Equal("63425c4a8b4291744a79dd9011fddc7a1f8ffda61f65d72196aa01d00cae2e2d", id)
 	as.Nil(err)
 
+	typ, id, err = containerByCgroup("/ecstasks.slice/ecstasks-3e61c214bc3ed9ff81e21474dd6cba17.slice/docker-63425c4a8b4291744a79dd9011fddc7a1f8ffda61f65d72196aa01d00cae2e2d.scope")
+	as.Equal(typ, ContainerTypeDocker)
+	as.Equal("63425c4a8b4291744a79dd9011fddc7a1f8ffda61f65d72196aa01d00cae2e2d", id)
+	as.Nil(err)
+
 	typ, id, err = containerByCgroup("/lxc/mysql-primary-db")
 	as.Equal(typ, ContainerTypeLxc)
 	as.Equal("mysql-primary-db", id)

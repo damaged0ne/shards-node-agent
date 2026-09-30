@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coroot/coroot-node-agent/common"
 	"github.com/golang/snappy"
 	"github.com/jpillora/backoff"
 	"github.com/prometheus/client_golang/prometheus"
@@ -75,10 +77,8 @@ func StartAgent(reg *prometheus.Registry, cfg Config, machineId, systemUuid stri
 			model.JobLabel:      jobName,
 		},
 		httpClient: http.Client{
-			Timeout: RemoteWriteTimeout,
-			Transport: &http.Transport{
-				TLSClientConfig: cfg.TLSConfig,
-			},
+			Timeout:   RemoteWriteTimeout,
+			Transport: newTransport(cfg.TLSConfig),
 		},
 		spoolDir:     path.Join(cfg.WalDir, "spool"),
 		maxSpoolSize: cfg.MaxSpoolSize,
@@ -96,6 +96,14 @@ func StartAgent(reg *prometheus.Registry, cfg Config, machineId, systemUuid stri
 	go a.sendLoop()
 	go a.scrapeLoop()
 	return nil
+}
+
+// newTransport returns a clone of http.DefaultTransport (which honors HTTP(S)_PROXY/NO_PROXY
+// and has sane timeouts and connection pooling) with the given TLS config.
+func newTransport(tlsConfig *tls.Config) *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = tlsConfig
+	return t
 }
 
 func (a *Agent) scrapeLoop() {
@@ -137,12 +145,14 @@ func (a *Agent) sendLoop() {
 		}
 
 		if errors.Is(err, errRejectedByCollector) {
+			common.AgentRemoteWriteFailures.Inc()
 			klog.Warningf("dropping spool file %s: %s", fName, err)
 			_ = os.Remove(fName)
 			b.Reset()
 			continue
 		}
 
+		common.AgentRemoteWriteFailures.Inc()
 		dur := b.Duration()
 		klog.Warningf(
 			"failed to send metrics to %s, next attempt in %s: %s",
@@ -177,7 +187,11 @@ func (a *Agent) send(fPath string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		// drain the body so the underlying connection can be reused (keep-alive)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode >= 300 {
 		if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge {
 			return fmt.Errorf("%w: %s", errRejectedByCollector, resp.Status)

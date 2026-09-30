@@ -212,4 +212,5 @@ type RequestData struct {
 	StatementId uint32
 	Payload     []byte
 	IsInbound   bool
+	Timestamp   uint64 // kernel monotonic time (bpf_ktime_get_ns) when the response was observed
 }
