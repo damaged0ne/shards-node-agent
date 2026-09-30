@@ -110,9 +110,9 @@ func initLogging() {
 	klog.SetOutput(&RateLimitedLogOutput{limiter: rate.NewLimiter(rate.Limit(*flags.LogPerSecond), *flags.LogBurst)})
 }
 
-func newHttpMux(registry *prometheus.Registry, registerer prometheus.Registerer) *http.ServeMux {
+func newHttpMux(gatherer prometheus.Gatherer, registerer prometheus.Registerer) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
+	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{ErrorLog: logger{}, Registry: registerer}))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
@@ -225,11 +225,12 @@ func main() {
 	}, machineId, systemUuid); err != nil {
 		klog.Exitln(err)
 	}
+	gatherer, stopShards := startShards(registry, registerer, hostname)
 	ready.Store(true)
 
 	klog.Infoln("listening on:", *flags.ListenAddress)
 
-	srv := &http.Server{Addr: *flags.ListenAddress, Handler: newHttpMux(registry, registerer), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *flags.ListenAddress, Handler: newHttpMux(gatherer, registerer), ReadHeaderTimeout: 10 * time.Second}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
@@ -252,6 +253,12 @@ func main() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		shardsStopped := make(chan struct{})
+		go func() {
+			defer close(shardsStopped)
+			stopShards()
+		}()
+		defer func() { <-shardsStopped }()
 		cr.Close()
 		profiling.Stop()
 		flushCtx, flushCancel := context.WithTimeout(context.Background(), 8*time.Second)
