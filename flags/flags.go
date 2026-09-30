@@ -50,7 +50,9 @@ var (
 	WalDir         = kingpin.Flag("wal-dir", "Path to where the agent stores data (e.g. the metrics Write-Ahead Log)").Default(defaultWalDir).Envar(envar("WAL_DIR")).String()
 	MaxSpoolSize   = kingpin.Flag("max-spool-size", "Maximum size of the on-disk spool used to buffer data when it cannot be sent to collector. Supports size suffixes like KB, MB, or GB.").Default("500MB").Envar(envar("MAX_SPOOL_SIZE")).Bytes()
 
-	EnablePprof = kingpin.Flag("enable-pprof", "Expose Go pprof debug handlers (/debug/pprof/) on the listen address").Default("false").Envar(envar("ENABLE_PPROF")).Bool()
+	EnablePprof             = kingpin.Flag("enable-pprof", "Expose Go pprof debug handlers (/debug/pprof/) on the listen address").Default("false").Envar(envar("ENABLE_PPROF")).Bool()
+	EbpfPerfBufferScale     = kingpin.Flag("ebpf-perf-buffer-scale", "Multiplier for the per-CPU sizes of all eBPF perf buffers. Increase it if node_agent_ebpf_lost_samples_total grows").Default("1").Envar(envar("EBPF_PERF_BUFFER_SCALE")).Int()
+	EbpfL7EventsBufferPages = kingpin.Flag("ebpf-l7-events-buffer-pages", "Per-CPU size of the eBPF L7 events perf buffer in memory pages (multiplied by --ebpf-perf-buffer-scale)").Default("32").Envar(envar("EBPF_L7_EVENTS_BUFFER_PAGES")).Int()
 
 	agentVersion = kingpin.Flag("version", "Print version and exit").Default("false").Bool()
 	Version      = "unknown"

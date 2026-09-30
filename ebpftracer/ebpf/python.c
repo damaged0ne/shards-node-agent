@@ -10,8 +10,9 @@ struct {
 } python_stats SEC(".maps");
 
 
+// keyed by pid_tgid; LRU because an entry is left behind if a thread dies inside pthread_cond_timedwait
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(key_size, sizeof(__u64));
     __uint(value_size, sizeof(__u64));
     __uint(max_entries, 10240);

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +22,7 @@ import (
 	"github.com/cilium/ebpf/perf"
 	"github.com/coroot/coroot-node-agent/common"
 	"github.com/coroot/coroot-node-agent/ebpftracer/l7"
+	"github.com/coroot/coroot-node-agent/flags"
 	"github.com/coroot/coroot-node-agent/proc"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
@@ -105,6 +105,11 @@ type Tracer struct {
 
 	globalUprobes     map[UprobeKey]*globalUprobe
 	globalUprobesLock sync.Mutex
+
+	// readersDone is closed by Close to stop the perf reader goroutines, readersWg tracks them
+	readersDone chan struct{}
+	readersWg   sync.WaitGroup
+	closeOnce   sync.Once
 }
 
 func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Tracer {
@@ -119,6 +124,7 @@ func NewTracer(hostNetNs, selfNetNs netns.NsHandle, disableL7Tracing bool) *Trac
 		readers:       map[string]*perf.Reader{},
 		uprobes:       map[string]*ebpf.Program{},
 		globalUprobes: map[UprobeKey]*globalUprobe{},
+		readersDone:   make(chan struct{}),
 	}
 }
 
@@ -138,15 +144,29 @@ func (t *Tracer) Run(events chan<- Event) error {
 	return nil
 }
 
+// Close detaches the eBPF programs and releases all resources.
+//
+// Contract: once Close returns, the Tracer never sends to the events channel passed to Run again,
+// so the caller may safely close that channel right after Close. Close stops the perf reader
+// goroutines and waits for them to exit; a reader blocked on sending to a full channel is released
+// as well, so Close doesn't hang even if nobody is consuming events. Close is idempotent, and it must
+// not be called concurrently with Run.
 func (t *Tracer) Close() {
+	t.closeOnce.Do(t.close)
+}
+
+func (t *Tracer) close() {
+	close(t.readersDone)
+	for _, r := range t.readers {
+		_ = r.Close()
+	}
+	t.readersWg.Wait()
+
 	for _, p := range t.uprobes {
 		_ = p.Close()
 	}
 	for _, l := range t.links {
 		_ = l.Close()
-	}
-	for _, r := range t.readers {
-		_ = r.Close()
 	}
 	t.globalUprobesLock.Lock()
 	for _, gu := range t.globalUprobes {
@@ -156,7 +176,9 @@ func (t *Tracer) Close() {
 	}
 	t.globalUprobes = nil
 	t.globalUprobesLock.Unlock()
-	t.collection.Close()
+	if t.collection != nil {
+		t.collection.Close()
+	}
 }
 
 func (t *Tracer) AcquireGlobalUprobe(path string, attach func() []link.Link) (UprobeKey, bool) {
@@ -261,9 +283,9 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		return fmt.Errorf("kernel tracing is not available: debugfs or tracefs must be mounted")
 	}
 
-	var flags string
+	var progFlags string
 	if isCtxExtraPaddingRequired(traceFsPath) {
-		flags = "ctx-extra-padding"
+		progFlags = "ctx-extra-padding"
 	}
 	kv := common.GetKernelVersion()
 	var prog []byte
@@ -272,14 +294,14 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		if !kv.GreaterOrEqual(pv) {
 			continue
 		}
-		if flags != p.flags {
+		if progFlags != p.flags {
 			continue
 		}
 		prog = p.prog
 		break
 	}
 	if len(prog) == 0 {
-		return fmt.Errorf("unsupported kernel version: %s %s", kv, flags)
+		return fmt.Errorf("unsupported kernel version: %s %s", kv, progFlags)
 	}
 
 	reader, err := gzip.NewReader(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(prog)))
@@ -318,16 +340,18 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		}
 	}
 
+	scale := flagValue(flags.EbpfPerfBufferScale, 1)
 	perfMaps := []perfMap{
-		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4},
-		{name: "tcp_listen_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
-		{name: "tcp_connect_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 8, readTimeout: 10 * time.Millisecond},
-		{name: "tcp_retransmit_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4},
-		{name: "file_events", typ: perfMapTypeFileEvents, perCPUBufferSizePages: 4},
+		{name: "proc_events", typ: perfMapTypeProcEvents, perCPUBufferSizePages: 4 * scale},
+		{name: "tcp_listen_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4 * scale},
+		{name: "tcp_connect_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 8 * scale, readTimeout: 10 * time.Millisecond},
+		{name: "tcp_retransmit_events", typ: perfMapTypeTCPEvents, perCPUBufferSizePages: 4 * scale},
+		{name: "file_events", typ: perfMapTypeFileEvents, perCPUBufferSizePages: 4 * scale},
 	}
 
 	if !t.disableL7Tracing {
-		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: 32})
+		pages := flagValue(flags.EbpfL7EventsBufferPages, 32) * scale
+		perfMaps = append(perfMaps, perfMap{name: "l7_events", typ: perfMapTypeL7Events, perCPUBufferSizePages: pages})
 	}
 
 	pageSize := os.Getpagesize()
@@ -335,10 +359,14 @@ func (t *Tracer) ebpf(ch chan<- Event) error {
 		r, err := perf.NewReaderWithOptions(t.collection.Maps[pm.name], pm.perCPUBufferSizePages*pageSize, perf.ReaderOptions{WakeupEvents: 100})
 		if err != nil {
 			t.Close()
-			return fmt.Errorf("failed to create ebpf reader: %w", err)
+			return fmt.Errorf("failed to create ebpf reader for %s (%d pages per CPU): %w", pm.name, pm.perCPUBufferSizePages, err)
 		}
 		t.readers[pm.name] = r
-		go runEventsReader(pm.name, r, ch, pm.typ, pm.readTimeout)
+		t.readersWg.Add(1)
+		go func(pm perfMap) {
+			defer t.readersWg.Done()
+			runEventsReader(pm.name, r, ch, t.readersDone, pm.typ, pm.readTimeout)
+		}(pm)
 	}
 
 	t.collectionSpec = collectionSpec
@@ -464,22 +492,41 @@ type l7Event struct {
 	Padding             uint8
 	StatementId         uint32
 	PayloadSize         uint64
+	// char payload[MAX_PAYLOAD_SIZE] follows in the C struct
+	Timestamp uint64 // bpf_ktime_get_ns() at the moment the event was emitted, located after the payload
 }
 
-func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapType, readTimeout time.Duration) {
+// flagValue returns the value of an integer flag, or def if the flag is unset or not positive
+// (e.g., in tests, where the flags are not parsed).
+func flagValue(f *int, def int) int {
+	if f == nil || *f <= 0 {
+		return def
+	}
+	return *f
+}
+
+func runEventsReader(name string, r *perf.Reader, ch chan<- Event, done <-chan struct{}, typ perfMapType, readTimeout time.Duration) {
 	if readTimeout == 0 {
 		readTimeout = 100 * time.Millisecond
 	}
+	lostSamples := common.AgentEbpfLostSamples.WithLabelValues(name)
+	decodeErrors := common.AgentEbpfDecodeErrors.WithLabelValues(name)
 	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
 		r.SetDeadline(time.Now().Add(readTimeout))
 		rec, err := r.Read()
 		if err != nil {
 			if errors.Is(err, perf.ErrClosed) {
-				break
+				return
 			}
 			continue
 		}
 		if rec.LostSamples > 0 {
+			lostSamples.Add(float64(rec.LostSamples))
 			klog.Errorln(name, "lost samples:", rec.LostSamples)
 			continue
 		}
@@ -487,13 +534,12 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 
 		switch typ {
 		case perfMapTypeL7Events:
-			v := &l7Event{}
-			reader := bytes.NewBuffer(rec.RawSample)
-			if err := binary.Read(reader, binary.LittleEndian, v); err != nil {
+			v, payload, err := decodeL7Event(rec.RawSample)
+			if err != nil {
+				decodeErrors.Inc()
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
-			payload := reader.Bytes()
 			req := &l7.RequestData{
 				Protocol:    l7.Protocol(v.Protocol),
 				Status:      l7.Status(v.Status),
@@ -501,32 +547,32 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 				Method:      l7.Method(v.Method),
 				StatementId: v.StatementId,
 				IsInbound:   v.IsInbound != 0,
+				Timestamp:   v.Timestamp,
 			}
-			switch {
-			case v.PayloadSize == 0:
-			case v.PayloadSize > MaxPayloadSize:
-				req.Payload = payload[:MaxPayloadSize]
-			default:
-				req.Payload = payload[:v.PayloadSize]
+			if size := min(v.PayloadSize, MaxPayloadSize, uint64(len(payload))); size > 0 {
+				req.Payload = payload[:size]
 			}
 			event = Event{Type: EventTypeL7Request, Pid: v.Pid, Fd: v.Fd, Timestamp: v.ConnectionTimestamp, L7Request: req}
 		case perfMapTypeFileEvents:
-			v := &fileEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+			v, err := decodeFileEvent(rec.RawSample)
+			if err != nil {
+				decodeErrors.Inc()
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Pid: v.Pid, Fd: v.Fd, Mnt: v.Mnt, Log: v.Log > 0}
 		case perfMapTypeProcEvents:
-			v := &procEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+			v, err := decodeProcEvent(rec.RawSample)
+			if err != nil {
+				decodeErrors.Inc()
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
 			event = Event{Type: v.Type, Reason: EventReason(v.Reason), Pid: v.Pid}
 		case perfMapTypeTCPEvents:
-			v := &tcpEvent{}
-			if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, v); err != nil {
+			v, err := decodeTCPEvent(rec.RawSample)
+			if err != nil {
+				decodeErrors.Inc()
 				klog.Warningln("failed to read msg:", err)
 				continue
 			}
@@ -551,7 +597,11 @@ func runEventsReader(name string, r *perf.Reader, ch chan<- Event, typ perfMapTy
 			continue
 		}
 
-		ch <- event
+		select {
+		case ch <- event:
+		case <-done:
+			return
+		}
 	}
 }
 

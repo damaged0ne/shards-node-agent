@@ -72,6 +72,7 @@ struct l7_event {
     __u32 statement_id;
     __u64 payload_size;
     char payload[MAX_PAYLOAD_SIZE];
+    __u64 timestamp; // bpf_ktime_get_ns() when the event is emitted; must stay the last field
 };
 
 struct {
@@ -187,6 +188,7 @@ void send_event(void *ctx, struct l7_event *e, struct connection_id cid, struct 
     e->connection_timestamp = conn->timestamp;
     e->fd = cid.fd;
     e->pid = cid.pid;
+    e->timestamp = bpf_ktime_get_ns();
     bpf_perf_event_output(ctx, &l7_events, BPF_F_CURRENT_CPU, e, sizeof(*e));
 }
 
@@ -257,6 +259,7 @@ int trace_enter_write(void *ctx, __u64 fd, __u16 is_tls, __u8 socket_only, char 
         new_conn.timestamp = bpf_ktime_get_ns();
         new_conn.is_inbound = 0;
         bpf_map_update_elem(&active_connections, &cid, &new_conn, BPF_NOEXIST);
+        delete_pending_l7_requests(cid.pid, cid.fd);
         conn = bpf_map_lookup_elem(&active_connections, &cid);
         if (!conn) {
             return 0;
@@ -421,7 +424,7 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
             req->partial = 1;
             req->payload_size = payload_length;
             req->ns = bpf_ktime_get_ns();
-            bpf_map_update_elem(&active_l7_requests, &k, req, BPF_NOEXIST);
+            bpf_map_update_elem(&active_l7_requests, &k, req, BPF_ANY);
         }
         return 0;
     }
@@ -429,7 +432,9 @@ int handle_request(void *ctx, struct connection_id cid, struct connection *conn,
         req->ns = bpf_ktime_get_ns();
     }
     COPY_PAYLOAD(req->payload, size, payload);
-    bpf_map_update_elem(&active_l7_requests, &k, req, BPF_NOEXIST);
+    // BPF_ANY: a new request must replace a pending one (e.g., a request whose response was never matched),
+    // otherwise its stale timestamp would be used to calculate the latency of all subsequent requests.
+    bpf_map_update_elem(&active_l7_requests, &k, req, BPF_ANY);
     return 0;
 }
 
@@ -489,6 +494,7 @@ int trace_exit_read(void *ctx, __u64 id, __u32 pid, __u16 is_tls, long int ret) 
         new_conn.timestamp = bpf_ktime_get_ns();
         new_conn.is_inbound = 1;
         bpf_map_update_elem(&active_connections, &cid, &new_conn, BPF_NOEXIST);
+        delete_pending_l7_requests(cid.pid, cid.fd);
         conn = bpf_map_lookup_elem(&active_connections, &cid);
         if (!conn) {
             return 0;
@@ -593,6 +599,17 @@ int handle_response(void *ctx, struct connection_id cid, struct connection *conn
     COPY_PAYLOAD(e->payload, req->payload_size, req->payload);
     if (e->protocol == PROTOCOL_HTTP) {
         response = is_http_response(payload, &e->status);
+        if (response && is_http_interim_status(e->status)) {
+            // "100 Continue" and the final response may arrive in a single read
+            if (ret > HTTP_100_CONTINUE_SIZE && is_http_100_continue(payload)) {
+                response = is_http_response(payload + HTTP_100_CONTINUE_SIZE, &e->status);
+            } else {
+                response = 0;
+            }
+            if (!response || is_http_interim_status(e->status)) {
+                return 0; // keeping the request in the map until the final response
+            }
+        }
     } else if (e->protocol == PROTOCOL_POSTGRES) {
         response = is_postgres_response(payload, ret, &e->status);
         if (req->request_type == POSTGRES_FRAME_PARSE) {
