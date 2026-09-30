@@ -21,3 +21,8 @@ var (
 var (
 	ReleaseWindow = kingpin.Flag("release-window", "How long a (re)created container is reported as being in its release window, can be overridden per container with the shards.release-window label (0 disables)").Default("30m").Envar(envar("RELEASE_WINDOW")).Duration()
 )
+
+var (
+	DisableScraping  = kingpin.Flag("disable-scraping", "Disable scraping local Prometheus targets (Docker containers labeled with prometheus.io/scrape=true and the jobs of --scrape-config-file)").Default("false").Envar(envar("DISABLE_SCRAPING")).Bool()
+	ScrapeConfigFile = kingpin.Flag("scrape-config-file", "Prometheus configuration file with additional scrape_configs and remote_write destinations").Envar(envar("SCRAPE_CONFIG_FILE")).String()
+)
